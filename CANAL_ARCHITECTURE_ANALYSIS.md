@@ -68,6 +68,12 @@
 59. [PeriodMixedMetaManager 元数据刷新](#59-periodmixedmetamanager-元数据刷新)
 60. [RDB Adapter：SQL 生成与批量写入](#60-rdb-adaptersql-生成与批量写入)
 61. [ES Adapter：ESSyncService 同步策略](#61-es-adapteressyncservice-同步策略)
+62. [LogEventConvert：LogEvent → Entry](#62-logeventconvertlogevent--entry)
+63. [AviaterRegexFilter 表级与列级过滤](#63-aviaterregexfilter-表级与列级过滤)
+64. [RDB 镜像库：RdbMirrorDbSyncService](#64-rdb-镜像库rdbmirrordbsyncservice)
+65. [example 模块示例对照](#65-example-模块示例对照)
+66. [CanalLauncher 进程启动全链路](#66-canallauncher-进程启动全链路)
+67. [MysqlConnector 连接阶段协议](#67-mysqlconnector-连接阶段协议)
 
 ---
 
@@ -739,6 +745,11 @@ FailbackLogPositionManager(
 | MQ 运行 | `CanalMQStarter`, `CanalStarter` | `server/...`, `deployer/...` |
 | RDB 落地 | `RdbAdapter`, `RdbSyncService`, `BatchExecutor` | `client-adapter/rdb/...` |
 | ES 落地 | `ESAdapter`, `ESSyncService` | `client-adapter/escore/...` |
+| 行转换 | `LogEventConvert` | `parse/.../dbsync/LogEventConvert.java` |
+| 表过滤 | `AviaterRegexFilter`, `RegexFunction` | `filter/.../aviater/` |
+| 镜像库 | `RdbMirrorDbSyncService` | `client-adapter/rdb/...` |
+| 示例 | `example` 模块各 Test/Example | `example/src/main/java/...` |
+| 进程入口 | `CanalLauncher` | `deployer/.../CanalLauncher.java` |
 
 ---
 
@@ -3465,6 +3476,334 @@ UPDATE/DELETE 用 **主键列** 构造 WHERE；`BatchExecutor` 单连接 `autoCo
 
 ---
 
+## 62. LogEventConvert：LogEvent → Entry
+
+`LogEventConvert` 是 binlog 五层中 **第四层→第五层** 的核心：`LogEvent`（dbsync 二进制对象）→ `CanalEntry.Entry`（Protobuf）。
+
+### 62.1 parse() 事件分发
+
+```97:144:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/dbsync/LogEventConvert.java
+    public Entry parse(LogEvent logEvent, boolean isSeek) {
+        switch (logEvent.getHeader().getType()) {
+            case QUERY_EVENT:        return parseQueryEvent(...);   // DDL/DCL/部分 DML
+            case XID_EVENT:          return parseXidEvent(...);     // 事务 COMMIT → TRANSACTIONEND
+            case TABLE_MAP_EVENT:    parseTableMapEvent(...);     // 更新 TableMeta，不产出 Entry
+            case WRITE_ROWS_EVENT:   return parseRowsEvent(...);
+            case UPDATE_ROWS_EVENT:  return parseRowsEvent(...);
+            case DELETE_ROWS_EVENT:  return parseRowsEvent(...);
+            case GTID_LOG_EVENT:     return parseGTIDLogEvent(...);
+            case HEARTBEAT_LOG_EVENT: return parseHeartbeatLogEvent(...);
+            ...
+        }
+    }
+```
+
+| LogEvent 类型 | 产出 EntryType | 说明 |
+|---------------|----------------|------|
+| QUERY（BEGIN） | TRANSACTIONBEGIN | 含 threadId、XA 信息 |
+| XID | TRANSACTIONEND | InnoDB 事务提交 |
+| WRITE/UPDATE/DELETE ROWS | ROWDATA | 行变更主体 |
+| GTID | 写入 Header.gtid | 供 GTID 位点 |
+| HEARTBEAT | HEARTBEAT | Master idle 信号 |
+
+`TABLE_MAP_EVENT` 只更新 `TableMetaCache`，**不向下游投递**；后续 ROW 事件用 `table_id` 查表结构。
+
+### 62.2 parseRowsEvent：行数据反序列化
+
+```521:597:parse/.../LogEventConvert.java
+    public Entry parseRowsEvent(RowsLogEvent event, TableMeta tableMeta) {
+        tableMeta = parseRowsEventForTableMeta(event);  // 从 cache 按 table_id 取
+        RowsLogBuffer buffer = event.getRowsBuf(charset);
+        while (buffer.nextOneRow(columns, false)) {
+            if (INSERT)  parseOneRow(..., isAfter=true);   // afterColumns
+            if (DELETE)  parseOneRow(..., isAfter=false);  // beforeColumns
+            if (UPDATE)  parseOneRow(before) + parseOneRow(after);
+            rowChangeBuider.addRowDatas(rowDataBuilder.build());
+        }
+        return createEntry(header, ROWDATA, rowChange.toByteString());
+    }
+```
+
+`parseOneRow` 按 `TableMeta.FieldMeta` 将 binlog 列值转为 `CanalEntry.Column`（含 `mysqlType`、`sqlType`、`value` 字符串）。支持：
+
+- **列级白/黑名单**：`fieldFilterMap` / `fieldBlackFilterMap`（`canal.instance.filter.field`）
+- **online DDL 列数不一致**：检测 `columnInfo.length > tableMeta.fields.size()`，结合 TSDB 或 RDS 无主键特殊列
+- **filterTableError**：表结构异常时返回 null 而非抛错（issue #92）
+
+### 62.3 与 TSDB 的配合
+
+`parseRowsEventForTableMeta` 从 `TableMetaCache` 按 **事件时间戳** 取对应版本的 `TableMeta`（§26）。`TABLE_MAP` 到达时更新 cache，保证 ROW 解析使用正确列定义。
+
+```mermaid
+flowchart LR
+    TME[TABLE_MAP_EVENT] --> Cache[TableMetaCache]
+  Cache --> PRE[parseRowsEventForTableMeta]
+    ROW[ROWS_EVENT] --> PRE
+    PRE --> parseOneRow
+    parseOneRow --> Entry[CanalEntry.Entry]
+```
+
+---
+
+## 63. AviaterRegexFilter 表级与列级过滤
+
+### 63.1 表级：schema.table 正则
+
+配置：`canal.instance.filter.regex`（白名单，默认 `.*\..*`）、`canal.instance.filter.black.regex`（黑名单）。
+
+```61:74:filter/src/main/java/com/alibaba/otter/canal/filter/aviater/AviaterRegexFilter.java
+    public boolean filter(String filtered) {
+        env.put("pattern", pattern);           // 多规则用 | 连接，已 ^...$ 包裹
+        env.put("target", filtered.toLowerCase());  // 如 mydb.mytable
+        return (Boolean) exp.execute(env);   // regex(pattern, target)
+    }
+```
+
+**构造优化**：
+
+1. 逗号分隔多规则 → 按 **长度降序** 排序（避免 `foo` 抢先匹配 `foot`）
+2. 每条规则加 `^` `$` 全匹配
+3. `RegexFunction` 使用 Apache ORO `Perl5Matcher.matches`
+
+```20:26:filter/src/main/java/com/alibaba/otter/canal/filter/aviater/RegexFunction.java
+    public AviatorObject call(Map env, AviatorObject arg1, AviatorObject arg2) {
+        return AviatorBoolean.valueOf(matcher.matches(text, PatternUtils.getPattern(pattern)));
+    }
+```
+
+黑名单构造时 `defaultEmptyValue=false`：空 pattern **不匹配任何表**（全部过滤）。
+
+### 63.2 过滤生效点
+
+| 阶段 | 组件 | 对象 |
+|------|------|------|
+| Parser | `AbstractEventParser.eventFilter` | 解析后 Entry，表名 `schema.table` |
+| Parser | `LogEventConvert.nameFilter` | ROW 解析前可跳过 |
+| Sink | `EntryEventSink.doFilter` | 投递 Store 前二次过滤 |
+| 客户端 | `Sub.filter` / `subscribe(filter)` | Server 动态更新 Parser filter（§51） |
+
+客户端 subscribe 的 filter **覆盖** instance 默认 regex，实现 per-client 订阅。
+
+### 63.3 列级过滤
+
+`canal.instance.filter.field` / `filter.black.field` 格式：`schema.table:col1,col2`，注入 `LogEventConvert.fieldFilterMap`，在 `parseOneRow` 中跳过非关注列，减小 Entry 体积。
+
+---
+
+## 64. RDB 镜像库：RdbMirrorDbSyncService
+
+**镜像库（mirrorDb）**：源库整库同步到目标库，**表结构随 DDL 自动演进**，无需为每张表写 mapping。
+
+### 64.1 配置形态
+
+`rdb.yml` 中 `mirrorDb` 段：指定 `database`、目标 `dataSourceKey`，与普通过表 mapping 并存。`RdbAdapter` 同时持有 `RdbSyncService` 与 `RdbMirrorDbSyncService`。
+
+### 64.2 同步逻辑
+
+```50:87:client-adapter/rdb/.../RdbMirrorDbSyncService.java
+    public void sync(List<Dml> dmls) {
+        for (Dml dml : dmls) {
+            MirrorDbConfig cfg = mirrorDbConfigCache.get(destination + "." + database);
+            if (dml.getIsDdl()) {
+                syncDml(dmlList);          // 先刷完积压 DML
+                executeDdl(cfg, dml);      // 目标库执行同源 DDL
+                remove columnsTypeCache / tableConfig
+            } else {
+                initMappingConfig(table, ...);  // 懒创建 1:1 表映射 mapAll=true
+                dmlList.add(dml);
+            }
+        }
+        syncDml(dmlList);
+    }
+```
+
+`initMappingConfig` 为每张首次出现的表自动生成 `MappingConfig`：`targetDb=sourceDb`、`targetTable=sourceTable`、`mapAll=true`、主键同名映射。
+
+### 64.3 DDL 执行
+
+```152:169:client-adapter/rdb/.../RdbMirrorDbSyncService.java
+    private void executeDdl(MirrorDbConfig mirrorDbConfig, Dml ddl) {
+        String sql = ddl.getSql().replace("`", backtick);  // 适配 Oracle/PG 引号
+        statement.execute(sql);
+        mirrorDbConfig.getTableConfig().remove(ddl.getTable());
+    }
+```
+
+**顺序保证**：DDL 前必须 `syncDml` 清空队列，避免 DML 与建表顺序错乱。
+
+### 64.4 与普通 RDB mapping 对比
+
+| 模式 | 配置量 | DDL | 列映射 |
+|------|--------|-----|--------|
+| 普通过表 mapping | 每表 yml | 需手工或 ETL | 可自定义 target 列 |
+| mirrorDb | 每库一条 | 自动转发 SQL | 全列 1:1 |
+
+---
+
+## 65. example 模块示例对照
+
+模块：`example/`，演示 **最小可运行消费端**，无 Spring 依赖。
+
+### 65.1 类层次
+
+```mermaid
+flowchart TB
+    Base[BaseCanalClientTest<br/>printEntry/printColumn]
+    Abstract[AbstractCanalClientTest<br/>connect/subscribe/get/ack 循环]
+    Simple[SimpleCanalClientTest]
+    Cluster[ClusterCanalClientTest]
+    Kafka[CanalKafkaClient*Example]
+    Rocket[CanalRocketMQ*Example]
+
+    Base --> Abstract
+    Abstract --> Simple & Cluster
+    AbstractKafka[AbstractKafkaTest] --> Kafka
+    AbstractRocket[AbstractRocektMQTest] --> Rocket
+```
+
+### 65.2 TCP 消费模板（与 Adapter 同源）
+
+```51:90:example/.../AbstractCanalClientTest.java
+    protected void process() {
+        while (running) {
+            connector.connect();
+            connector.subscribe();
+            while (running) {
+                Message message = connector.getWithoutAck(batchSize);
+                if (batchId != -1 && size > 0) {
+                    printEntry(message.getEntries());
+                }
+                if (batchId != -1) {
+                    connector.ack(batchId);
+                }
+            }
+        } catch (Throwable e) {
+            connector.rollback();
+        } finally {
+            connector.disconnect();
+        }
+    }
+```
+
+与 §44 `CanalTCPConsumer`、§37 CanalProtocol 完全一致。
+
+### 65.3 各入口对照
+
+| 类 | 连接方式 | 用途 |
+|----|----------|------|
+| `SimpleCanalClientTest` | `newSingleConnector(ip:11111)` | 单机 TCP |
+| `ClusterCanalClientTest` | `newClusterConnector(zk, dest)` | ZK 发现 Server + Failover |
+| `CanalKafkaClientExample` | `KafkaCanalConnector` protobuf | MQ 非 flat |
+| `CanalKafkaClientFlatMessageExample` | `KafkaCanalConnector(..., flat=true)` | FlatMessage JSON |
+| `CanalRocketMQClientExample` | `RocketMQCanalConnector` | RocketMQ 消费 |
+| `SimpleCanalClientPermanceTest` | 压测 batchSize/吞吐 | 性能基准 |
+
+`BaseCanalClientTest.printEntry` 演示如何解析 `TRANSACTIONBEGIN/ROWDATA`、打印 GTID（`header.gtid` 与 `props.curtGtid`）、BLOB 列 UTF-8 转换。
+
+---
+
+## 66. CanalLauncher 进程启动全链路
+
+入口：`deployer/.../CanalLauncher.main`。
+
+### 66.1 启动分支
+
+```mermaid
+flowchart TD
+    Main[CanalLauncher.main]
+    Load[加载 canal.properties]
+    Admin{canal.admin.manager 配置?}
+    Poll[PlainCanalConfigClient.findServer]
+    Scan[定时 server_polling 热更新]
+    Start[CanalStarter.start]
+    TCP[serverMode=tcp → Netty 11111]
+    MQ[serverMode=kafka/... → CanalMQStarter]
+    AdminNetty[CanalAdminWithNetty 11110]
+
+    Main --> Load --> Admin
+    Admin -->|是| Poll --> Start
+    Admin -->|否| Start
+    Poll --> Scan
+    Start --> TCP & MQ & AdminNetty
+```
+
+### 66.2 Manager 模式轮询
+
+```74:100:deployer/.../CanalLauncher.java
+    PlainCanalConfigClient configClient = new PlainCanalConfigClient(managerAddress, user, passwd, registerIp, adminPort, autoRegister, ...);
+    PlainCanal canalConfig = configClient.findServer(null);
+    managerProperties.putAll(properties);
+    executor.scheduleWithFixedDelay(() -> {
+        PlainCanal newConfig = configClient.findServer(lastMd5);
+        if (newConfig != null) {
+            canalStater.stop();
+            canalStater.start();   // 全局 canal.properties 变更 → 整进程重启
+        }
+    }, scanInterval);
+```
+
+`runningLatch.await()` 阻塞主线程，ShutdownHook 释放。
+
+### 66.3 与 CanalStarter 分工
+
+| 类 | 职责 |
+|----|------|
+| `CanalLauncher` | 读配置、Admin 轮询、创建 `CanalStarter` |
+| `CanalStarter` | 加载 MQ Producer、创建 `CanalController`、启 Admin Netty |
+| `CanalController` | Instance 生成、ZK Monitor、嵌入 Server |
+
+---
+
+## 67. MysqlConnector 连接阶段协议
+
+Canal 连 MySQL 使用 **标准 MySQL Client/Server 协议**（非 Canal 自定义协议），实现在 `driver/.../MysqlConnector.java`。
+
+### 67.1 连接阶段时序
+
+```mermaid
+sequenceDiagram
+    participant C as MysqlConnector
+    participant M as MySQL Master
+
+    M->>C: HandshakeInitializationPacket
+    opt sslMode != DISABLED
+        C->>M: SSL Request
+        C->>M: TLS 握手
+    end
+    C->>M: ClientAuthenticationPacket (scramble + plugin)
+    M->>C: OK / Error
+    Note over C,M: 之后可 COM_QUERY / COM_REGISTER_SLAVE / COM_BINLOG_DUMP
+```
+
+### 67.2 negotiate 核心步骤
+
+```182:212:driver/.../MysqlConnector.java
+    private void negotiate(SocketChannel channel) {
+        HandshakeInitializationPacket handshake = readHandshake();
+        if (sslMode != DISABLED) {
+            send SslRequestCommandPacket;
+            upgradeToSSL();
+        }
+        // 根据 server auth plugin 选择 mysql_native_password / caching_sha2 / sha256...
+        send ClientAuthenticationPacket(username, scramble(password, seed));
+        read OK packet;
+    }
+```
+
+与 Canal **消费端口认证**（§38）类似，均基于 MySQL scramble；但这里是 **真实连库账号**（`canal.instance.dbUsername`），权限需 `REPLICATION SLAVE, REPLICATION CLIENT` 等。
+
+### 67.3 与 dump 的关系
+
+`negotiate` 成功后，`MysqlConnection` 方可：
+
+1. `COM_QUERY` 查 `@@binlog_checksum`、`SHOW MASTER STATUS` 等
+2. `COM_REGISTER_SLAVE`（0x15）
+3. `COM_BINLOG_DUMP` / `COM_BINLOG_DUMP_GTID`（§52）
+
+连接池：`SocketChannelPool` 复用 channel；`soTimeout` 默认 1h，与 binlog 长连接匹配。
+
+---
+
 ## 附录：推荐阅读源码顺序
 
 若希望自行通读 Binlog 监听全链路，建议按以下顺序：
@@ -3521,6 +3860,12 @@ UPDATE/DELETE 用 **主键列** 构造 WHERE；`BatchExecutor` 单连接 `autoCo
 50. `PeriodMixedMetaManager` — cursor 定时刷 ZK  
 51. `RdbSyncService` + `BatchExecutor` — JDBC 落地  
 52. `ESSyncService.insert/update` — ES 多策略同步  
+53. `LogEventConvert.parse/parseRowsEvent` — LogEvent 转 Entry  
+54. `AviaterRegexFilter` + `RegexFunction` — 表白名单  
+55. `RdbMirrorDbSyncService` — 镜像库 DDL/DML  
+56. `AbstractCanalClientTest` + example 各 Example — 消费端模板  
+57. `CanalLauncher.main` + `CanalStarter.start` — 进程启动  
+58. `MysqlConnector.negotiate` — MySQL 连接认证  
 
 ---
 
