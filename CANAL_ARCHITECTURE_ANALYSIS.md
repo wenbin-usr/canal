@@ -1,7 +1,7 @@
 # Alibaba Canal 源码架构与 Binlog 监听原理深度分析
 
 > 基于 canal **1.1.9-SNAPSHOT** 源码梳理，面向需要深入理解实现细节的开发者。  
-> 本文已合并原 `CLIENT_ADAPTER_SOURCE_ANALYSIS.md` 全文，并持续补充通信协议、Deployer、Server、Store/Sink、Meta、MQ、Client、Admin、Prometheus、Instance 生成模式、ZK/Manager 注册等模块源码剖析。
+> 本文已合并原 `CLIENT_ADAPTER_SOURCE_ANALYSIS.md` 全文，并持续补充 Spring 装配、事务缓冲/Sink/Store、MQ 模式、Meta、RDB/ES Adapter、通信协议等模块源码剖析。
 
 ---
 
@@ -51,6 +51,23 @@
 42. [CanalMessageSerializerUtil 序列化](#42-canalmessageserializerutil-序列化)
 43. [RabbitMQ / Pulsar Producer](#43-rabbitmq--pulsar-producer)
 44. [client-adapter MQ 消费全链路](#44-client-adapter-mq-消费全链路)
+45. [FlatMessage 与 CommonMessage 数据模型](#45-flatmessage-与-commonmessage-数据模型)
+46. [CanalEntry 协议结构](#46-canalentry-协议结构)
+47. [ClusterCanalConnector 集群消费与 Failover](#47-clustercanalconnector-集群消费与-failover)
+48. [ClientRunningMonitor 消费端 HA](#48-clientrunningmonitor-消费端-ha)
+49. [CanalConnectors 连接工厂](#49-canalconnectors-连接工厂)
+50. [MysqlMultiStageCoprocessor 并行解析](#50-mysqlmultistagecoprocessor-并行解析)
+51. [AbstractCanalInstance 组件装配与生命周期](#51-abstractcanalinstance-组件装配与生命周期)
+52. [MySQL 复制命令包补充（GTID / Semi-sync）](#52-mysql-复制命令包补充gtid--semi-sync)
+53. [Spring 装配：default-instance.xml 全图](#53-spring-装配default-instancexml-全图)
+54. [EventTransactionBuffer 与事务切分](#54-eventtransactionbuffer-与事务切分)
+55. [EntryEventSink 事务过滤与空事务策略](#55-entryeventsink-事务过滤与空事务策略)
+56. [Store 批次组装与 ddlIsolation](#56-store-批次组装与-ddlisolation)
+57. [CanalMQConfig 与 CanalMQStarter](#57-canalmqconfig-与-canalmqstarter)
+58. [CanalStarter：tcp 与 MQ 模式切换](#58-canalstartertcp-与-mq-模式切换)
+59. [PeriodMixedMetaManager 元数据刷新](#59-periodmixedmetamanager-元数据刷新)
+60. [RDB Adapter：SQL 生成与批量写入](#60-rdb-adaptersql-生成与批量写入)
+61. [ES Adapter：ESSyncService 同步策略](#61-es-adapteressyncservice-同步策略)
 
 ---
 
@@ -714,6 +731,14 @@ FailbackLogPositionManager(
 | MQ 消费 SPI | `CanalMsgConsumer`, `CanalKafkaConsumer`, `CanalTCPConsumer` | `connector/*/consumer/` |
 | MQ 序列化 | `CanalMessageSerializerUtil` | `connector/core/.../util/` |
 | 认证 | `SecurityUtil.scramble411` | `protocol/.../SecurityUtil.java` |
+| 扁平消息 | `FlatMessage`, `CommonMessage`, `MQMessageUtils` | `protocol/...`, `connector/core/...` |
+| 实例核心 | `AbstractCanalInstance`, `CanalInstanceWithSpring` | `instance/core/...`, `instance/spring/...` |
+| 连接工厂 | `CanalConnectors` | `client/.../CanalConnectors.java` |
+| Spring 装配 | `default-instance.xml`, `base-instance.xml` | `deployer/src/main/resources/spring/` |
+| 事务缓冲 | `EventTransactionBuffer` | `parse/.../EventTransactionBuffer.java` |
+| MQ 运行 | `CanalMQStarter`, `CanalStarter` | `server/...`, `deployer/...` |
+| RDB 落地 | `RdbAdapter`, `RdbSyncService`, `BatchExecutor` | `client-adapter/rdb/...` |
+| ES 落地 | `ESAdapter`, `ESSyncService` | `client-adapter/escore/...` |
 
 ---
 
@@ -2649,6 +2674,797 @@ flowchart LR
 
 ---
 
+## 45. FlatMessage 与 CommonMessage 数据模型
+
+MQ 模式与 client-adapter 普遍使用 **行级 JSON** 而非完整 `CanalEntry` Protobuf。Canal 内部有两层近似结构：
+
+| 类 | 模块 | 用途 |
+|----|------|------|
+| `FlatMessage` | `protocol` | Server 端 MQ Producer 构造、序列化为 JSON 投递 |
+| `CommonMessage` | `connector/core` | Consumer SPI 统一返回类型，字段与 FlatMessage 对齐 |
+| `Dml` | `client-adapter/common` | Adapter 落地层内部模型，`MessageUtil` 负责转换 |
+
+### 45.1 FlatMessage 字段说明
+
+```12:30:protocol/src/main/java/com/alibaba/otter/canal/protocol/FlatMessage.java
+public class FlatMessage implements Serializable {
+    private long id;                          // 对应 Message.batchId
+    private String database;                  // schema
+    private String table;
+    private List<String> pkNames;             // 主键列名
+    private Boolean isDdl;
+    private String type;                      // INSERT / UPDATE / DELETE / CREATE / ...
+    private Long es;                          // binlog executeTime（毫秒）
+    private Long ts;                          // Canal 构建时间戳
+    private String sql;                       // DDL 时有值
+    private Map<String, Integer> sqlType;     // 列 → JDBC Types
+    private Map<String, String> mysqlType;    // 列 → mysql 类型字符串
+    private List<Map<String, String>> data;   // 变更后行（INSERT/UPDATE 的 after）
+    private List<Map<String, String>> old;    // 变更前行（UPDATE/DELETE）
+    private String gtid;
+}
+```
+
+**一行 binlog 多行数据**：`data` / `old` 为 `List<Map>`，每个 Map 对应一行；UPDATE 时 `data[i]` 与 `old[i]` 一一对应。
+
+### 45.2 Server 端构造：MQMessageUtils.messageConverter
+
+```355:376:connector/core/src/main/java/com/alibaba/otter/canal/connector/core/producer/MQMessageUtils.java
+    public static List<FlatMessage> messageConverter(EntryRowData[] datas, long id) {
+        FlatMessage flatMessage = new FlatMessage(id);
+        flatMessage.setDatabase(entry.getHeader().getSchemaName());
+        flatMessage.setTable(entry.getHeader().getTableName());
+        flatMessage.setIsDdl(rowChange.getIsDdl());
+        flatMessage.setType(eventType.toString());
+        flatMessage.setEs(entry.getHeader().getExecuteTime());
+        flatMessage.setGtid(entry.getHeader().getGtid());
+        // 遍历 RowData → 填充 data/old/sqlType/mysqlType/pkNames
+    }
+```
+
+`messagePartition(FlatMessage, partitionsNum, pkHashConfigs)` 按主键 hash 拆分到不同 MQ 分区，保证 **同一主键行变更顺序**。
+
+### 45.3 Adapter 侧：flatMessage2Dml
+
+```149:175:client-adapter/common/.../MessageUtil.java
+    public static Dml flatMessage2Dml(String destination, String groupId, CommonMessage commonMessage) {
+        Dml dml = new Dml();
+        dml.setDestination(destination);
+        dml.setDatabase(commonMessage.getDatabase());
+        dml.setType(commonMessage.getType());
+        dml.setData(commonMessage.getData());   // Map<String,Object>，已做类型转换
+        dml.setOld(commonMessage.getOld());
+        return dml;
+    }
+```
+
+TCP 模式走 `parse4Dml(Message)`：从 `CanalEntry.Entry` → `RowChange` → `Dml`，需解析 `storeValue` 二进制。
+
+---
+
+## 46. CanalEntry 协议结构
+
+定义：`protocol/.../EntryProtocol.proto`，生成类 `CanalEntry`。
+
+### 46.1 核心消息层次
+
+```mermaid
+flowchart TB
+    Entry[Entry]
+    Header[Header]
+    RowChange[RowChange in storeValue]
+    RowData[RowData]
+    Column[Column]
+
+    Entry --> Header
+    Entry -->|entryType=ROWDATA| RowChange
+    RowChange --> RowData
+    RowData --> Column
+```
+
+```12:22:protocol/src/main/java/com/alibaba/otter/canal/protocol/EntryProtocol.proto
+message Entry {
+     Header header = 1;
+     EntryType entryType = 2;    // TRANSACTIONBEGIN / ROWDATA / TRANSACTIONEND / HEARTBEAT
+     bytes storeValue = 3;       // entryType 对应的嵌套 protobuf 序列化结果
+}
+```
+
+### 46.2 Header 关键字段
+
+| 字段 | 含义 |
+|------|------|
+| `logfileName` + `logfileOffset` | binlog 位点（file + position） |
+| `executeTime` | 变更在 MySQL 执行时间 |
+| `schemaName` / `tableName` | 库表 |
+| `eventType` | INSERT/UPDATE/DELETE/CREATE/... |
+| `gtid` | GTID 模式下事务标识 |
+
+### 46.3 EntryType 与 storeValue 对应关系
+
+| entryType | storeValue 解析为 | 说明 |
+|-----------|-------------------|------|
+| TRANSACTIONBEGIN | `TransactionBegin` | 事务开始，含 threadId |
+| ROWDATA | `RowChange` | DML/DDL 主体 |
+| TRANSACTIONEND | `TransactionEnd` | 事务结束 |
+| HEARTBEAT | — | 内部心跳，常过滤 |
+
+`RowChange` 含 `isDdl`、`sql`（DDL）、`rowDatas[]`（DML 多行）。每行 `RowData` 有 `beforeColumns` / `afterColumns`。
+
+### 46.4 Message 与 Entry 的关系
+
+- `Message`（Java 类）：一次 `getWithoutAck` 返回的 **批次**，含 `id`（batchId）+ `List<Entry>`。
+- TCP `MESSAGES` 包：`batch_id` + 多个 Entry 的 **独立 protobuf 字节**。
+- 事务边界：同一 batch 可含 BEGIN + 多 ROWDATA + END；MQ flat 模式通常跳过 BEGIN/END。
+
+---
+
+## 47. ClusterCanalConnector 集群消费与 Failover
+
+`ClusterCanalConnector` 包装 `SimpleCanalConnector`，在 **subscribe/get/ack 失败时自动 disconnect → sleep → connect** 换节点重试。
+
+### 47.1 三种寻址策略（CanalConnectors）
+
+| 工厂方法 | AccessStrategy | 寻址方式 |
+|----------|----------------|----------|
+| `newSingleConnector` | 无（直连） | 固定 `SocketAddress` |
+| `newClusterConnector(List)` | `SimpleNodeAccessStrategy` | 静态 Server 列表轮询 |
+| `newClusterConnector(zkServers)` | `ClusterNodeAccessStrategy` | ZK 动态发现 |
+
+### 47.2 ClusterNodeAccessStrategy：双路径监听
+
+```52:75:client/src/main/java/com/alibaba/otter/canal/client/impl/ClusterNodeAccessStrategy.java
+        // 路径1：/destinations/{dest}/cluster/ 子节点列表 → 候选 Server 地址（shuffle）
+        String clusterPath = ZookeeperPathUtils.getDestinationClusterRoot(destination);
+        zkClient.subscribeChildChanges(clusterPath, childListener);
+
+        // 路径2：/destinations/{dest}/running → 当前 active Server
+        String runningPath = ZookeeperPathUtils.getDestinationServerRunning(destination);
+        zkClient.subscribeDataChanges(runningPath, dataListener);
+
+    public SocketAddress nextNode() {
+        if (runningAddress != null) {
+            return runningAddress;           // 优先连 active 节点
+        } else if (!currentAddress.isEmpty()) {
+            return currentAddress.get(0);      // lazy 启动：触发第一台 start
+        }
+        throw new ServerNotFoundException(...);
+    }
+```
+
+**与 §41 ServerRunningMonitor 的关系**：Server 抢 `running` 成功后写入 `ServerRunningData.address`；Client 读同一节点得到 `ip:port`（数据端口 11111）。
+
+### 47.3 Failover 重试模板
+
+```278:286:client/src/main/java/com/alibaba/otter/canal/client/impl/ClusterCanalConnector.java
+    private void restart() throws CanalClientException {
+        disconnect();
+        Thread.sleep(retryInterval);   // 默认 5s
+        connect();                     // nextNode() 可能指向新 active
+    }
+```
+
+`getWithoutAck` / `ack` / `subscribe` 均在 catch 后调用 `restart()`，默认 `retryTimes=3`。`retryTimes=-1` 时 subscribe 阻塞等待可被 `InterruptedException` 优雅打断（issue 相关修复）。
+
+`connect()` 内 `SimpleCanalConnector` 重写 `getNextAddress()` → `accessStrategy.nextNode()`，实现 **无硬编码 IP 的透明切换**。
+
+---
+
+## 48. ClientRunningMonitor 消费端 HA
+
+与 Server 侧 `ServerRunningMonitor` 对称，保证 **同一 destination + clientId 只有一个消费进程 active**。
+
+### 48.1 ZK 路径
+
+`/otter/canal/destinations/{destination}/{clientId}/running`（EPHEMERAL）
+
+### 48.2 抢占与切换
+
+```107:131:client/src/main/java/com/alibaba/otter/canal/client/impl/running/ClientRunningMonitor.java
+    public synchronized void initRunning() {
+        String path = ZookeeperPathUtils.getDestinationClientRunning(destination, clientData.getClientId());
+        try {
+            zkClient.create(path, bytes, CreateMode.EPHEMERAL);
+            processActiveEnter();   // 回调 listener → doConnect
+            mutex.set(true);
+        } catch (ZkNodeExistsException e) {
+            activeData = JsonUtils.unmarshalFromByte(zkClient.readData(path), ClientRunningData.class);
+            if (isMine(activeData.getAddress())) {
+                mutex.set(true);    // 避免活锁（issue #697）
+            }
+        }
+    }
+```
+
+`SimpleCanalConnector.connect()` 若设置了 `runningMonitor`，则 **先 `waitClientRunning()` 抢 ZK 节点**，成为 active 后才 `doConnect()`；`disconnect()` 时 stop monitor 并释放节点。
+
+### 48.3 典型部署
+
+| 模式 | 组件 | 效果 |
+|------|------|------|
+| 单 Client 直连 | 无 Monitor | 简单消费 |
+| Client 多机 HA | `ClientRunningMonitor` + 相同 clientId | 主备消费，备机 standby |
+| Client 连 Server 集群 | `ClusterCanalConnector` + ZK | Server 与 Client 双层 HA |
+
+---
+
+## 49. CanalConnectors 连接工厂
+
+统一入口 `client/.../CanalConnectors.java`，屏蔽 `SimpleCanalConnector` / `ClusterCanalConnector` 构造细节。
+
+```29:75:client/src/main/java/com/alibaba/otter/canal/client/CanalConnectors.java
+    public static CanalConnector newSingleConnector(SocketAddress address, String destination, ...) {
+        SimpleCanalConnector c = new SimpleCanalConnector(address, username, password, destination);
+        c.setSoTimeout(60 * 1000);
+        c.setIdleTimeout(60 * 60 * 1000);
+        return c;
+    }
+
+    public static CanalConnector newClusterConnector(List addresses, ...) {
+        return new ClusterCanalConnector(..., new SimpleNodeAccessStrategy(addresses));
+    }
+
+    public static CanalConnector newClusterConnector(String zkServers, ...) {
+        return new ClusterCanalConnector(..., new ClusterNodeAccessStrategy(destination, ZkClientx.getZkClient(zkServers)));
+    }
+```
+
+默认超时：`soTimeout=60s`（单次读包），`idleTimeout=1h`（传给 Server 侧 IdleStateHandler）。
+
+**example 模块**与 **connector/tcp-connector** 均通过此工厂或等价的 `SimpleCanalConnector` / `ClusterCanalConnector` 接入。
+
+---
+
+## 50. MysqlMultiStageCoprocessor 并行解析
+
+当 `canal.instance.parser.parallel=true` 时，`MysqlConnection.dump` 走 **MultiStageCoprocessor** 路径，用 LMAX Disruptor 将解析拆为多阶段流水线。
+
+### 50.1 四阶段模型
+
+```29:37:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/MysqlMultiStageCoprocessor.java
+ * 1. 网络接收 (单线程)        — MysqlConnection 读 socket → publish LogBuffer
+ * 2. 事件基本解析 (单线程)    — 事件类型、DDL 建 TableMeta、维护位点
+ * 3. 事件深度解析 (多线程)    — DML 行数据完整反序列化
+ * 4. 投递到 store (单线程)    — EventTransactionBuffer → Sink
+```
+
+与单线程 `dump(..., SinkFunction)` 对比：
+
+```182:210:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/MysqlConnection.java
+    // 单线程：fetch → decode → sink 在同循环
+    public void dump(String binlogfilename, Long binlogPosition, SinkFunction func) {
+        while (fetcher.fetch()) {
+            LogEvent event = decoder.decode(fetcher, context);
+            func.sink(event);
+        }
+    }
+
+    // 并行：fetch 只 publish LogBuffer，解码在 Disruptor worker
+    public void dump(String binlogfilename, Long binlogPosition, MultiStageCoprocessor coprocessor) {
+        while (fetcher.fetch()) {
+            LogBuffer buffer = fetcher.duplicate();
+            coprocessor.publish(buffer);
+        }
+    }
+```
+
+### 50.2 配置与背压
+
+- `ringBufferSize`：Disruptor 环形缓冲大小，满时 `publish` 阻塞，形成对网络读的背压。
+- `parserThreadCount`：阶段 3 并行 worker 数。
+- `eventsPublishBlockingTime`：统计 publish 阻塞耗时，可用于监控。
+
+适用场景：宽表、大行、高 QPS 时把 **CPU 密集的 Row 解析** 从 IO 线程剥离；代价是内存占用与复杂度上升。
+
+---
+
+## 51. AbstractCanalInstance 组件装配与生命周期
+
+每个 **destination** 对应一个 `CanalInstance`，是 Parser/Sink/Store/Meta 的容器。
+
+### 51.1 核心依赖
+
+```33:41:instance/core/src/main/java/com/alibaba/otter/canal/instance/core/AbstractCanalInstance.java
+    protected String destination;
+    protected CanalEventStore<Event> eventStore;
+    protected CanalEventParser eventParser;
+    protected CanalEventSink<List<CanalEntry.Entry>> eventSink;
+    protected CanalMetaManager metaManager;
+    protected CanalAlarmHandler alarmHandler;
+    protected CanalMQConfig mqConfig;
+```
+
+Spring 模式由 `default-instance.xml` 注入具体实现 Bean；`CanalInstanceWithSpring` 继承 `AbstractCanalInstance`。
+
+### 51.2 启动顺序
+
+```76:98:instance/core/src/main/java/com/alibaba/otter/canal/instance/core/AbstractCanalInstance.java
+    public void start() {
+        metaManager.start();
+        alarmHandler.start();
+        eventStore.start();
+        eventSink.start();
+        beforeStartEventParser(eventParser);
+        eventParser.start();    // 最后启动：开始连 MySQL dump
+    }
+```
+
+**停止顺序相反**：先停 Parser（断 binlog），再停 Sink/Store，最后 Meta。
+
+### 51.3 subscribe 与 filter 热更新
+
+`subscribeChange(ClientIdentity)` 将客户端 filter 设为 `AviaterRegexFilter` 注入 `AbstractEventParser`；`GroupEventParser` 时对每个子 Parser 分别设置（§33）。
+
+数据流：
+
+```mermaid
+flowchart LR
+    MySQL --> Parser[eventParser]
+    Parser --> Sink[eventSink]
+    Sink --> Store[eventStore]
+    Store --> Server[CanalServerWithEmbedded]
+    Meta[metaManager] -.->|cursor/ack| Server
+```
+
+---
+
+## 52. MySQL 复制命令包补充（GTID / Semi-sync）
+
+§6 已介绍 `COM_BINLOG_DUMP`；此处补充 GTID 与半同步细节。
+
+### 52.1 命令字对照
+
+| 命令 | 字节 | 类 | 场景 |
+|------|------|-----|------|
+| COM_REGISTER_SLAVE | 0x15 | `RegisterSlaveCommandPacket` | dump 前注册 slaveId |
+| COM_BINLOG_DUMP | 0x12 | `BinlogDumpCommandPacket` | 按 file+position |
+| COM_BINLOG_DUMP_GTID | 0x1e | `BinlogDumpGTIDCommandPacket` | 按 GTIDSet |
+
+### 52.2 GTID Dump 包结构
+
+```31:64:driver/.../BinlogDumpGTIDCommandPacket.java
+    public byte[] toBytes() {
+        out.write(getCommand());                              // 0x1e
+        ByteHelper.writeUnsignedShortLittleEndian(BINLOG_THROUGH_GTID, out);  // flags
+        ByteHelper.writeUnsignedIntLittleEndian(slaveServerId, out);
+        ByteHelper.writeUnsignedIntLittleEndian(0, out);      // binlog-filename-len = 0
+        ByteHelper.writeUnsignedInt64LittleEndian(4, out);    // binlog-pos 占位
+        byte[] bs = gtidSet.encode();
+        ByteHelper.writeUnsignedIntLittleEndian(bs.length, out);
+        out.write(bs);                                        // GTID set 二进制
+    }
+```
+
+`MysqlConnection.dump(GTIDSet)` **不调用** `sendRegisterSlave`（与 file 模式不同），直接 `sendBinlogDumpGTID`。
+
+### 52.3 dump 主流程（file 模式）
+
+```182:210:parse/.../MysqlConnection.java
+    public void dump(String binlogfilename, Long binlogPosition, SinkFunction func) {
+        updateSettings();
+        loadBinlogChecksum();
+        sendRegisterSlave();
+        sendBinlogDump(binlogfilename, binlogPosition);
+        while (fetcher.fetch()) {
+            LogEvent event = decoder.decode(fetcher, context);
+            func.sink(event);
+            if (event.getSemival() == 1) {
+                sendSemiAck(...);   // 半同步复制 ACK
+            }
+        }
+    }
+```
+
+### 52.4 Semi-sync 与 checksum
+
+- `loadBinlogChecksum()`：查询 `@@binlog_checksum`，设置 `FormatDescriptionLogEvent` 的 checksum 算法，否则 `LogDecoder` 解析 ROW 事件会错位。
+- `sendSemiAck`：当 Master 开启半同步且事件 `semival==1` 时回 ACK，否则 Master 可能阻塞提交。
+
+---
+
+## 53. Spring 装配：default-instance.xml 全图
+
+每个 destination 对应一个 Spring 子上下文，加载 `classpath:spring/default-instance.xml`（import `base-instance.xml`）。
+
+### 53.1 配置加载链
+
+```14:22:deployer/src/main/resources/spring/base-instance.xml
+    <bean class="...PropertyPlaceholderConfigurer">
+        <property name="locationNames">
+            <list>
+                <value>classpath:canal.properties</value>
+                <value>classpath:${canal.instance.destination:}/instance.properties</value>
+            </list>
+        </property>
+    </bean>
+```
+
+Manager 模式下 `PlainCanalInstanceGenerator` 用 `propertiesLocal` 覆盖占位符（§28），无需物理 `conf/{dest}/` 目录。
+
+### 53.2 Bean 依赖图
+
+```mermaid
+flowchart TB
+    subgraph Instance
+        CI[CanalInstanceWithSpring]
+    end
+    subgraph Core
+        EP[eventParser<br/>RdsBinlogEventParserProxy]
+        ES[eventSink<br/>EntryEventSink]
+        ST[eventStore<br/>MemoryEventStoreWithBuffer]
+        MM[metaManager<br/>PeriodMixedMetaManager]
+        AH[alarmHandler<br/>LogAlarmHandler]
+        MQ[mqConfig<br/>CanalMQConfig]
+    end
+    subgraph ParserDeps
+        HA[HeartBeatHAController]
+        F1[AviaterRegexFilter]
+        LP[FailbackLogPositionManager]
+        AUTH[AuthenticationInfo master/standby]
+    end
+    subgraph MetaDeps
+        ZK[ZkClientx]
+        ZMM[ZooKeeperMetaManager]
+    end
+
+    CI --> EP & ES & ST & MM & AH & MQ
+    ES --> ST
+    EP --> HA & F1 & LP & AUTH
+    MM --> ZMM --> ZK
+```
+
+### 53.3 关键配置项与 Bean 映射
+
+| instance.properties 键 | 注入 Bean / 属性 | 作用 |
+|------------------------|------------------|------|
+| `canal.instance.master.address` | `eventParser.masterInfo` | MySQL 主库 |
+| `canal.instance.filter.regex` | `eventParser.eventFilter` | 表白名单 |
+| `canal.instance.transaction.size` | `eventParser.transactionSize` → `EventTransactionBuffer` | 事务内最大 entry 数 |
+| `canal.instance.memory.buffer.size` | `eventStore.bufferSize` | Store 环形槽位数 |
+| `canal.instance.memory.rawEntry` | `eventStore.raw` | TCP 是否 raw 透传 |
+| `canal.instance.parser.parallel` | `eventParser.parallel` | Disruptor 并行 |
+| `canal.instance.gtidon` | `eventParser.isGTIDMode` | GTID dump |
+| `canal.mq.topic` 等 | `mqConfig` | MQ 投递目标（§57） |
+
+`baseEventParser` 抽象父类为 `RdsBinlogEventParserProxy`：未配置 RDS 时行为等同 `MysqlEventParser`（§33）。
+
+---
+
+## 54. EventTransactionBuffer 与事务切分
+
+Parser 将 `LogEvent` 转为 `CanalEntry.Entry` 后，先进入 `EventTransactionBuffer`，**按事务边界批量 flush 到 Sink**。
+
+### 54.1 flush 触发条件
+
+```65:90:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/EventTransactionBuffer.java
+    public void add(CanalEntry.Entry entry) {
+        switch (entry.getEntryType()) {
+            case TRANSACTIONBEGIN:
+                flush();           // 先刷上一事务
+                put(entry);
+                break;
+            case TRANSACTIONEND:
+                put(entry);
+                flush();           // 事务结束，整包提交 Sink
+                break;
+            case ROWDATA:
+                put(entry);
+                if (!isDml(eventType)) {
+                    flush();       // DDL 等非 DML 立即刷出
+                }
+                break;
+            case HEARTBEAT:
+                put(entry);
+                flush();
+                break;
+        }
+    }
+```
+
+### 54.2 与 transactionSize 的关系
+
+`AbstractEventParser.start()` 中：
+
+```149:150:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/AbstractEventParser.java
+        transactionBuffer.setBufferSize(transactionSize);// 默认 1024
+```
+
+当单事务内 ROW 数超过 `bufferSize`（2 的幂），`put()` 会 **中途 flush**，把大事务 **切成多个 Entry 列表** 投递 Sink（`default-instance.xml` 注释：超过大小后切分为多个事务投递）。
+
+### 54.3 数据流位置
+
+```mermaid
+flowchart LR
+    LogEvent --> LogEventConvert
+    LogEventConvert --> ETB[EventTransactionBuffer]
+    ETB -->|flush List Entry| Sink[EntryEventSink]
+    Sink --> Store[MemoryEventStoreWithBuffer]
+```
+
+---
+
+## 55. EntryEventSink 事务过滤与空事务策略
+
+`EntryEventSink` 在 `sinkData` 中做 **表级 filter**、**空事务压缩**、**Store 背压**（§16 已述 `doSink`/`tryPut`）。
+
+### 55.1 filterTransactionEntry
+
+配置：`canal.instance.filter.transaction.entry`（MQ 模式可由 `canal.mq.filterTransactionEntry` 自动设为 true）。
+
+```99:114:sink/src/main/java/com/alibaba/otter/canal/sink/entry/EntryEventSink.java
+            if (filterTransactionEntry && (entryType == TRANSACTIONBEGIN || entryType == TRANSACTIONEND)) {
+                if (lastTransactionCount <= emptyTransctionThresold   // 8192
+                    && abs(executeTime - lastTransactionTimestamp) <= emptyTransactionInterval) {  // 5s
+                    continue;   // 丢弃空事务头尾
+                } else if (entryType == TRANSACTIONEND) {
+                    lastTransactionCount.set(0L);  // 仅 END 重置计数，保证 BEGIN/END 成对
+                }
+            }
+```
+
+目的：高 QPS 下大量 **无行变更的空事务** 不占 Store；仍周期性放行 END，便于推进位点。
+
+### 55.2 空事务放行策略
+
+若无 ROWDATA/HEARTBEAT，仅含 BEGIN/END：
+
+```126:139:sink/src/main/java/com/alibaba/otter/canal/sink/entry/EntryEventSink.java
+            if (filterEmtryTransactionEntry && !events.isEmpty()) {
+                if (abs(currentTimestamp - lastEmptyTransactionTimestamp) > emptyTransactionInterval
+                    || lastEmptyTransactionCount > emptyTransctionThresold) {
+                    return doSink(events);   // 每 5s 或超 8192 次放一批
+                }
+            }
+            return true;   // 多数空事务直接丢弃
+```
+
+### 55.3 HeartBeatEntryEventHandler
+
+构造时默认 `addHandler(new HeartBeatEntryEventHandler())`，在 `before/after` 链路上处理心跳 Entry（与 detecting SQL 心跳配合）。
+
+---
+
+## 56. Store 批次组装与 ddlIsolation
+
+`MemoryEventStoreWithBuffer.doGet` 决定 **一次 getWithoutAck 返回哪些 Event**。
+
+### 56.1 两种 batchMode
+
+| 模式 | 配置 | 停止条件 |
+|------|------|----------|
+| `MEMSIZE`（默认） | `canal.instance.memory.batch.mode=MEMSIZE` | 累计内存 ≥ `batchSize * bufferMemUnit` |
+| `ITEMSIZE` | `ITEMSIZE` | 条数 ≥ `batchSize` |
+
+### 56.2 ddlIsolation
+
+`canal.instance.get.ddl.isolation=true` 时：
+
+```294:303:store/src/main/java/com/alibaba/otter/canal/store/memory/MemoryEventStoreWithBuffer.java
+                if (ddlIsolation && isDdl(event.getEventType())) {
+                    if (entrys.size() == 0) {
+                        entrys.add(event);   // batch 仅含本条 DDL
+                    } else {
+                        end = next - 1;      // DDL 不混入 DML batch
+                    }
+                    break;
+                }
+```
+
+保证 **DDL 单独成批**，避免与 DML 混在一个 `Message` 里导致下游执行顺序问题。
+
+### 56.3 ack 位点选择（GTID）
+
+```340:348:store/src/main/java/com/alibaba/otter/canal/store/memory/MemoryEventStoreWithBuffer.java
+        for (int i = entrys.size() - 1; i >= 0; i--) {
+            Event event = entrys.get(i);
+            if (TRANSACTIONEND == event.getEntryType() || isDdl(event.getEventType()) ...) {
+                range.setAck(CanalEventUtils.createPosition(event));
+                break;
+            }
+        }
+```
+
+GTID 模式下 **ack 必须落在事务 END**，否则重连会从 GTID 中间开始导致丢最后一个事务。
+
+---
+
+## 57. CanalMQConfig 与 CanalMQStarter
+
+### 57.1 Instance 级 MQ 目标
+
+```229:237:deployer/src/main/resources/spring/default-instance.xml
+    <bean id="mqConfig" class="com.alibaba.otter.canal.instance.core.CanalMQConfig">
+        <property name="topic" value="${canal.mq.topic}" />
+        <property name="dynamicTopic" value="${canal.mq.dynamicTopic}" />
+        <property name="partitionsNum" value="${canal.mq.partitionsNum}" />
+        <property name="partitionHash" value="${canal.mq.partitionHash}" />
+        ...
+    </bean>
+```
+
+每个 destination 可有 **独立 topic / 动态 topic 规则 / 分区 hash**（表主键字段列表）。
+
+### 57.2 每 destination 一个 Worker
+
+```62:68:server/src/main/java/com/alibaba/otter/canal/server/CanalMQStarter.java
+            String[] dsts = StringUtils.split(destinations, ",");
+            for (String destination : dsts) {
+                CanalMQRunnable canalMQRunnable = new CanalMQRunnable(destination);
+                canalMQWorks.put(destination, canalMQRunnable);
+                executorService.execute(canalMQRunnable);
+            }
+```
+
+Worker 内部逻辑：
+
+```157:199:server/src/main/java/com/alibaba/otter/canal/server/CanalMQStarter.java
+                canalDestination.setTopic(mqConfig.getTopic());
+                canalDestination.setDynamicTopic(mqConfig.getDynamicTopic());
+                canalServer.subscribe(clientIdentity);   // clientId 固定 1001
+                message = canalServer.getWithoutAck(clientIdentity, getBatchSize, ...);
+                canalMQProducer.send(canalDestination, message, new Callback() {
+                    public void commit() { canalServer.ack(clientIdentity, batchId); }
+                    public void rollback() { canalServer.rollback(clientIdentity, batchId); }
+                });
+```
+
+**本质**：MQ 模式是内置的 **虚拟客户端**（destination + clientId=1001），与外部 TCP 客户端竞争同一 Store；`CanalController` 在 instance 启停时调用 `startDestination` / `stopDestination` 联动 MQ 线程。
+
+### 57.3 dynamicTopic 示例
+
+`canal.mq.dynamicTopic` 形如 `test\\..*` → topic 名 `test_{schema}_{table}`，由 `MQMessageUtils.messageTopics` 按 Entry 拆分后并行 send（§31）。
+
+---
+
+## 58. CanalStarter：tcp 与 MQ 模式切换
+
+全局配置：`canal.serverMode`（`canal.properties`），取值 `tcp` | `kafka` | `rocketMQ` | `rabbitMQ` | `pulsarmq` 等。
+
+```64:84:deployer/src/main/java/com/alibaba/otter/canal/deployer/CanalStarter.java
+        String serverMode = CanalController.getProperty(properties, CanalConstants.CANAL_SERVER_MODE);
+        if (!"tcp".equalsIgnoreCase(serverMode)) {
+            canalMQProducer = loader.getExtension(serverMode.toLowerCase(), "/plugin", "/canal/plugin");
+            canalMQProducer.init(properties);
+            System.setProperty(CanalConstants.CANAL_WITHOUT_NETTY, "true");  // 可不启 11111
+            if (mqProperties.isFlatMessage()) {
+                System.setProperty("canal.instance.memory.rawEntry", "false");  // 避免 ByteString 二次解析
+            }
+        }
+        controller.start();
+        if (canalMQProducer != null) {
+            canalMQStarter.start(CanalController.getDestinations(properties));
+        }
+```
+
+| serverMode | 11111 TCP | MQ Producer | Store rawEntry（flat 时） |
+|------------|-----------|-------------|---------------------------|
+| tcp | 启用 | 无 | 默认 true |
+| kafka/... | 可禁用 | SPI 加载 | 强制 false |
+
+Admin 端口 11110 与 `CanalController` 在两种模式下均会启动（若配置）。
+
+---
+
+## 59. PeriodMixedMetaManager 元数据刷新
+
+`default-instance.xml` 默认 Meta 实现：**内存 + ZK 定时合并**。
+
+```26:30:meta/src/main/java/com/alibaba/otter/canal/meta/PeriodMixedMetaManager.java
+ * 1. 去除 batch 数据刷新到 zk，切换时 batch 可忽略
+ * 2. cursor 定时刷新，合并多次 ack 请求
+```
+
+| 数据 | 内存 | ZK 持久化 |
+|------|------|-----------|
+| subscribe / filter | MemoryMetaManager | ZK |
+| cursor（消费位点） | 内存 + 脏标记 | 每 `period` ms 批量 flush |
+| batch mark（未 ack） | 启动时从 ZK 加载 | 运行期 **不写 ZK**（切换可重放） |
+
+`canal.zookeeper.flush.period` 默认 1000ms。与 `ZooKeeperMetaManager`（§25）配合，cursor 路径见 §41。
+
+---
+
+## 60. RDB Adapter：SQL 生成与批量写入
+
+模块：`client-adapter/rdb`，`@SPI("rdb")`。
+
+### 60.1 配置与映射
+
+- `rdb/mytest_user.yml`：`outerAdapterKey` → `MappingConfig`（源表 → 目标库表、列映射、主键 hash 并发）。
+- `mappingConfigCache` 键：`{destination}_{database}-{table}`（MQ 模式加 `groupId` 前缀）。
+
+### 60.2 同步流水线
+
+```154:186:client-adapter/rdb/.../RdbSyncService.java
+    public void sync(Map mappingConfig, List<Dml> dmls, ...) {
+        sync(dmls, dml -> {
+            if (dml.getIsDdl()) { columnsTypeCache.remove(...); return false; }
+            configMap = mappingConfig.get(destination + "_" + database + "-" + table);
+            for (MappingConfig config : configMap.values()) {
+                appendDmlPartition(config, dml);  // 按 pkHash 分到 threads 个队列
+            }
+            return true;
+        });
+    }
+```
+
+`appendDmlPartition`：`SingleDml.dml2SingleDmls` 把多行 Dml 拆成单行，再 `pkHash % threads` 分区并行。
+
+### 60.3 SQL 拼装（INSERT 示例）
+
+```249:267:client-adapter/rdb/.../RdbSyncService.java
+    private void insert(BatchExecutor batchExecutor, MappingConfig config, SingleDml dml) {
+        Map<String, String> columnsMap = SyncUtil.getColumnsMap(dbMapping, data);
+        insertSql.append("INSERT INTO ").append(SyncUtil.getDbTableName(dbMapping, dbType)).append(" (");
+        columnsMap.forEach((targetCol, srcCol) -> insertSql.append(backtick).append(targetCol)...);
+        insertSql.append(") VALUES (");
+        // SyncUtil.getTargetColumnValue 做类型转换后 BatchExecutor.execute
+    }
+```
+
+UPDATE/DELETE 用 **主键列** 构造 WHERE；`BatchExecutor` 单连接 `autoCommit=false`，多句 `execute` 后一次 `commit()`。
+
+### 60.4 BatchExecutor
+
+```54:74:client-adapter/rdb/.../BatchExecutor.java
+    public void execute(String sql, List<Map<String, ?>> values) {
+        PreparedStatement pstmt = getConn().prepareStatement(sql);
+        SyncUtil.setPStmt(type, pstmt, value, i + 1);
+        pstmt.execute();
+    }
+    public void commit() { getConn().commit(); }
+```
+
+`skipDupException` 可忽略唯一键冲突；`mirror` 模式走 `RdbMirrorDbSyncService` 整库镜像（独立配置块）。
+
+---
+
+## 61. ES Adapter：ESSyncService 同步策略
+
+模块：`client-adapter/escore`（`ES6xAdapter` / `ES7xAdapter` / `ES8xAdapter` 继承 `ESAdapter`）。
+
+### 61.1 入口
+
+```42:61:client-adapter/escore/.../ESSyncService.java
+    public void sync(Collection<ESSyncConfig> esSyncConfigs, Dml dml) {
+        for (ESSyncConfig config : esSyncConfigs) {
+            this.sync(config, dml);   // 一张源表可映射多个 ES index
+        }
+    }
+```
+
+### 61.2 按 DML 类型分发
+
+```93:102:client-adapter/escore/.../ESSyncService.java
+            if (type.equalsIgnoreCase("INSERT")) {
+                insert(config, dml);
+            } else if (type.equalsIgnoreCase("UPDATE")) {
+                update(config, dml);
+            } else if (type.equalsIgnoreCase("DELETE")) {
+                delete(config, dml);
+            }
+```
+
+### 61.3 insert 的四种路径
+
+`insert` 根据 `SchemaItem`（由 mapping 中 SQL 解析）选择策略：
+
+| 场景 | 方法 | 行为 |
+|------|------|------|
+| 单表、字段均为简单映射 | `singleTableSimpleFiledInsert` | 直接用 Dml 行数据写 ES document |
+| 主表变更 | `mainTableInsert` | 执行 mapping SQL 查全字段再索引 |
+| 从表、简单关联 | `joinTableSimpleFieldOperation` | 用关联字段拼 ES 文档局部更新 |
+| 从表、复杂 SQL / 子查询 | `wholeSqlOperation` | 全量 SQL 重查后 upsert ES |
+
+`SchemaItem` 由 `SqlParser` 解析 yml 中的 `sql` 字段得到表关系与 SELECT 列表；`ESTemplate` 封装 bulk index/update/delete。
+
+### 61.4 与 RDB 的差异
+
+- RDB：**行列映射 + JDBC PreparedStatement**，强调事务批量。
+- ES：**文档模型 + 可能回源 SQL 补全字段**，支持宽表、多表 join 映射；`syncByTimestamp` 模式跳过实时 DML，走定时全量。
+
+---
+
 ## 附录：推荐阅读源码顺序
 
 若希望自行通读 Binlog 监听全链路，建议按以下顺序：
@@ -2688,6 +3504,23 @@ flowchart LR
 33. `CanalMessageSerializerUtil` — MQ 与 TCP 序列化双路径  
 34. `CanalRabbitMQProducer` / `CanalPulsarMQProducer` — 其余 MQ SPI  
 35. `AdapterProcessor` + `CanalKafkaConsumer` — adapter MQ 消费闭环  
+36. `FlatMessage` + `MQMessageUtils.messageConverter` — MQ 行级 JSON  
+37. `EntryProtocol.proto` — Entry/RowChange/Header 结构  
+38. `ClusterNodeAccessStrategy` + `ClusterCanalConnector.restart` — Client 集群 Failover  
+39. `ClientRunningMonitor` — 消费端 ZK 选主  
+40. `CanalConnectors` — 三种连接模式入口  
+41. `MysqlMultiStageCoprocessor` — Disruptor 四阶段并行解析  
+42. `AbstractCanalInstance.start` — Instance 组件启动顺序  
+43. `BinlogDumpGTIDCommandPacket` + `MysqlConnection.dump` — GTID 与半同步  
+44. `default-instance.xml` + `base-instance.xml` — Spring Bean 装配  
+45. `EventTransactionBuffer` — 事务边界 flush  
+46. `EntryEventSink.sinkData` — 空事务过滤  
+47. `MemoryEventStoreWithBuffer.doGet` — batch 与 ddlIsolation  
+48. `CanalMQStarter.worker` + `CanalMQConfig` — MQ 虚拟客户端  
+49. `CanalStarter.start` — serverMode 切换  
+50. `PeriodMixedMetaManager` — cursor 定时刷 ZK  
+51. `RdbSyncService` + `BatchExecutor` — JDBC 落地  
+52. `ESSyncService.insert/update` — ES 多策略同步  
 
 ---
 
