@@ -1,7 +1,7 @@
 # Alibaba Canal 源码架构与 Binlog 监听原理深度分析
 
 > 基于 canal **1.1.9-SNAPSHOT** 源码梳理，面向需要深入理解实现细节的开发者。  
-> 本文已合并原 `CLIENT_ADAPTER_SOURCE_ANALYSIS.md` 全文，并持续补充 Spring 装配、事务缓冲/Sink/Store、MQ 模式、Meta、RDB/ES Adapter、通信协议等模块源码剖析。
+> 本文已合并原 `CLIENT_ADAPTER_SOURCE_ANALYSIS.md` 全文，并持续补充 Spring 装配、事务/Meta/Store、MQ 路由、DDL 解析、Adapter、通信协议、故障排查等模块源码剖析。
 
 ---
 
@@ -74,6 +74,11 @@
 65. [example 模块示例对照](#65-example-模块示例对照)
 66. [CanalLauncher 进程启动全链路](#66-canallauncher-进程启动全链路)
 67. [MysqlConnector 连接阶段协议](#67-mysqlconnector-连接阶段协议)
+68. [MemoryMetaManager 与 batch 语义](#68-memorymetamanager-与-batch-语义)
+69. [MQMessageUtils 分区 hash 与 dynamicTopic](#69-mqmessageutils-分区-hash-与-dynamictopic)
+70. [DruidDdlParser：DDL 语句解析](#70-druidddlparserddl-语句解析)
+71. [MysqlDetectingTimeTask 与主备切换](#71-mysqldetectingtimetask-与主备切换)
+72. [全链路故障排查清单](#72-全链路故障排查清单)
 
 ---
 
@@ -750,6 +755,9 @@ FailbackLogPositionManager(
 | 镜像库 | `RdbMirrorDbSyncService` | `client-adapter/rdb/...` |
 | 示例 | `example` 模块各 Test/Example | `example/src/main/java/...` |
 | 进程入口 | `CanalLauncher` | `deployer/.../CanalLauncher.java` |
+| Meta 内存 | `MemoryMetaManager`, `MemoryClientIdentityBatch` | `meta/...` |
+| MQ 路由 | `MQMessageUtils` | `connector/core/.../MQMessageUtils.java` |
+| DDL 解析 | `DruidDdlParser` | `parse/.../ddl/DruidDdlParser.java` |
 
 ---
 
@@ -3804,6 +3812,305 @@ sequenceDiagram
 
 ---
 
+## 68. MemoryMetaManager 与 batch 语义
+
+`MemoryMetaManager` 是 Meta 的 **纯内存实现**，`PeriodMixedMetaManager`（§59）在其上增加 ZK 定时刷 cursor。
+
+### 68.1 三类核心状态
+
+| 结构 | 键 | 值 | 含义 |
+|------|-----|-----|------|
+| `destinations` | destination | `List<ClientIdentity>` | 已订阅客户端 |
+| `cursors` | `ClientIdentity` | `Position` | 已 ack 的消费位点 |
+| `batches` | `ClientIdentity` | `MemoryClientIdentityBatch` | 已 get 未 ack 的批次 |
+
+### 68.2 getWithoutAck → addBatch
+
+```324:367:server/.../CanalServerWithEmbedded.java
+        synchronized (canalInstance) {
+            PositionRange last = metaManager.getLastestBatch(clientIdentity);
+            if (last != null) {
+                events = getEvents(store, last.getStart(), batchSize, ...);  // 续拉同一流
+            } else {
+                Position start = metaManager.getCursor(clientIdentity);
+                if (start == null) start = store.getFirstPosition();
+                events = getEvents(store, start, batchSize, ...);
+            }
+            if (events.isEmpty()) return new Message(-1, ...);  // 无数据，不分配 batchId
+            Long batchId = metaManager.addBatch(clientIdentity, events.getPositionRange());
+            return new Message(batchId, raw, entrys);
+        }
+```
+
+**要点**：
+
+- `synchronized(canalInstance)` 保证 meta 与 store 顺序一致（注释说明不能先拿 meta 再乱序拿数据）。
+- 存在未 ack 的 `lastestBatch` 时，从 `positionRange.start` **继续拉**（支持多次 get 拼同一逻辑流，但通常一次 get 一批）。
+- `batchId` 由 `atomicMaxBatchId` 自增生成。
+
+### 68.3 ack 必须按 batchId 升序
+
+```147:156:meta/.../MemoryMetaManager.java
+        public synchronized PositionRange removePositionRange(Long batchId) {
+            Long minBatchId = Collections.min(batches.keySet());
+            if (!minBatchId.equals(batchId)) {
+                throw new CanalMetaManagerException("batchId is not the firstly");
+            }
+            return batches.remove(batchId);
+        }
+```
+
+客户端 **不能** 先 ack batch 5 再 ack batch 4；否则抛 `CanalMetaManagerException`。`ack` 成功后：
+
+1. `updateCursor(positionRanges.getAck())` — 持久化消费位点（事务 END 或 DDL，§56）
+2. `eventStore.ack(end, endSeq)` — 释放环形缓冲槽位
+
+### 68.4 rollback 语义
+
+| API | Meta | Store |
+|-----|------|-------|
+| `rollback(clientIdentity)` | `clearAllBatchs` | `store.rollback()` 回到 get 前 |
+| `rollback(clientIdentity, batchId)` | `removeBatch(batchId)`（须最小 id） | `store.rollback()` |
+
+`SimpleCanalConnector.connect()` 默认 `rollbackOnConnect=true`，清除上次异常退出遗留的未 ack batch。
+
+### 68.5 batch 与 ZK mark 节点
+
+运行期 batch **不写 ZK**（`PeriodMixedMetaManager` 设计）；仅 cursor 定时刷盘。进程崩溃后未 ack 数据可 **重放**（at-least-once）。
+
+---
+
+## 69. MQMessageUtils 分区 hash 与 dynamicTopic
+
+配置入口：`canal.mq.partitionHash`、`canal.mq.dynamicTopic`、`canal.mq.dynamicTopicPartitionNum`、`canal.mq.database.hash`。
+
+### 69.1 partitionHash 配置语法
+
+```45:69:connector/core/.../MQMessageUtils.java
+    // 分号分隔多条；每条格式：
+    //   schema.table          → tableHash（按表名 hash）
+    //   schema.table:id^name  → 按指定列 hash
+    //   schema.table:$pk$     → 按主键列 hash（autoPkHash）
+    // 表名可写正则，走 AviaterRegexFilter
+```
+
+示例（`canal.properties`）：
+
+```properties
+canal.mq.partitionHash = mydb.order:id^user_id;mydb\\..*:$pk$
+canal.mq.partitionsNum = 4
+canal.mq.database.hash = true
+```
+
+### 69.2 hash 算法
+
+```299:318:connector/core/.../MQMessageUtils.java
+    int hashCode = 0;
+    if (databaseHash) hashCode = database.hashCode();
+    for (Column column : columns) {
+        if (column.getIsKey() || pkNames.contains(column.getName())) {
+            hashCode = hashCode ^ column.getValue().hashCode();
+        }
+    }
+    int pkHash = Math.abs(Math.abs(hashCode) % partitionsNum);
+```
+
+- **异或累加** 主键列字符串 hash，再对分区数取模。
+- **同一主键** 始终落同一分区，保证分区内顺序。
+- **DDL** 固定进分区 0；无匹配规则时进分区 0。
+- **UPDATE/DELETE** 用 `beforeColumns` 算 hash（删/改前主键）。
+
+`flatMessage` 模式对 `List<Map<String,String>> data` 每行独立 hash，可能 **拆成多个 FlatMessage** 发到不同分区。
+
+### 69.3 dynamicTopic 路由
+
+```139:164:connector/core/.../MQMessageUtils.java
+    public static Map<String, Message> messageTopics(Message message, String defaultTopic, String dynamicTopicConfigs) {
+        for (Entry entry : entries) {
+            // 跳过 TRANSACTION BEGIN/END
+            Set<String> topics = matchTopics(schema + "." + table, dynamicTopicConfigs);
+            // 命中则 message 按 topic 拆分
+        }
+    }
+```
+
+配置示例：
+
+```properties
+canal.mq.topic = canal_topic
+canal.mq.dynamicTopic = mytopic:mydb\\..*,other_topic:mydb.order
+```
+
+- 无 `:` 的项：表名匹配则 topic = `schema.table`（小写）。
+- 有 `:` 的项：`topic:schema.table.regex`。
+- 与 `partitionHash` 正交：先 **按 topic 拆 Message**，再在每个 topic 内 **按 hash 选分区**。
+
+---
+
+## 70. DruidDdlParser：DDL 语句解析
+
+当 `canal.instance.filter.druid.ddl=true`（默认）时，`LogEventConvert.parseQueryEvent` 用 **Druid SQL Parser** 解析 QUERY 事件中的 DDL，产出结构化 `DdlResult` 更新 TSDB / 过滤无关 DDL。
+
+### 70.1 入口
+
+```47:56:parse/.../ddl/DruidDdlParser.java
+    public static List<DdlResult> parse(String queryString, String schemaName) {
+        stmtList = SQLUtils.parseStatements(queryString, JdbcConstants.MYSQL, false);
+        // ParserException → 退回 EventType.QUERY 原样透传
+    }
+```
+
+### 70.2 支持的语句类型
+
+| SQL 类型 | EventType | 用途 |
+|----------|-----------|------|
+| CREATE TABLE | CREATE | TSDB 记表结构 |
+| ALTER TABLE | ALTER / RENAME / CINDEX / DINDEX | 表结构变更 |
+| DROP TABLE | ERASE | 删表 |
+| CREATE/DROP DATABASE | CREATE/ERASE | 库级 |
+| TRUNCATE | TRUNCATE | 清表 |
+| RENAME TABLE | RENAME | 表改名 |
+
+对比 `SimpleDdlParser`：Druid 版覆盖 **更全的 ALTER 子类型**（加索引、约束等），适合 `enableTsdb=true` 场景。
+
+### 70.3 与 filterQueryDdl 的关系
+
+- `filterQueryDdl=true`：QUERY 类 DDL 在 Parser 层直接丢弃，不进 Store。
+- `useDruidDdlFilter=true`：仍解析 DDL 更新 meta，但可通过 `DdlResult` 判断是否下发给客户端。
+
+---
+
+## 71. MysqlDetectingTimeTask 与主备切换
+
+配置（`default-instance.xml`）：
+
+- `canal.instance.detecting.enable`
+- `canal.instance.detecting.sql`（如 `select 1`）
+- `canal.instance.detecting.interval.time`（默认 5s）
+- `canal.instance.detecting.heartbeatHaEnable` → `HeartBeatHAController.switchEnable`
+- `canal.instance.standby.address` 备库
+
+### 71.1 心跳任务
+
+```215:254:parse/.../MysqlEventParser.java
+    class MysqlDetectingTimeTask extends TimerTask {
+        public void run() {
+            mysqlConnection.query(detectingSQL);  // 或 update
+            ((HeartBeatCallback) haController).onSuccess(costTime);
+        } catch (Throwable e) {
+            ((HeartBeatCallback) haController).onFailed(e);
+        }
+    }
+```
+
+使用 **独立 fork 连接** 执行心跳 SQL，不阻塞 binlog dump 主连接。
+
+### 71.2 失败触发切换
+
+```33:45:parse/.../ha/HeartBeatHAController.java
+    public void onFailed(Throwable e) {
+        if (++failedTimes > detectingRetryTimes && switchEnable) {
+            eventParser.doSwitch();  // master ↔ standby
+            failedTimes = 0;
+        }
+    }
+```
+
+`doSwitch()` 停止当前 dump → 切换 `runningInfo` → 按 `fallbackIntervalInSeconds` 回退位点 → 重新 `findStartPosition` → dump。
+
+```mermaid
+sequenceDiagram
+    participant HB as MysqlDetectingTimeTask
+    participant HA as HeartBeatHAController
+    participant P as MysqlEventParser
+
+    HB->>HA: onFailed (连续 N 次)
+    HA->>P: doSwitch()
+    P->>P: stop dump / 换 standbyInfo
+    P->>P: findStartPosition + dump
+```
+
+---
+
+## 72. 全链路故障排查清单
+
+按 **数据流向** 分层排查，附常见现象与对应配置/源码位置。
+
+### 72.1 MySQL / Parser 层
+
+| 现象 | 可能原因 | 排查 |
+|------|----------|------|
+| 连不上 Master | 账号权限、网络、SSL | `REPLICATION SLAVE/CLIENT`；`MysqlConnector.negotiate` 日志 |
+| dump 立刻断开 | `slaveId` 冲突 | 全局唯一 `canal.instance.mysql.slaveId` |
+| `ServerLogPurgedException` | binlog 被清理 | 调大保留；`auto.reset.latest.pos.mode`；RDS 用 OSS 模式 §33 |
+| 无数据 / 位点不动 | 过滤掉所有表 | `filter.regex` / `filter.black.regex` §63 |
+| GTID 丢事务 | ack 位点不在事务 END | §56 `ddlIsolation` / GTID ack 规则 |
+| 表结构解析失败 | TSDB 无历史 meta | `enableTsdb`；`filter.table.error` |
+| 主备不切 | 心跳未开或 `heartbeatHaEnable=false` | §71 detecting 配置 |
+
+### 72.2 Server / Store 层
+
+| 现象 | 可能原因 | 排查 |
+|------|----------|------|
+| 客户端 get 一直空 | instance 未启动 / 非 active 节点 | ZK `running` §41；`ServerRunningMonitor` |
+| get 有数据 ack 失败 | batchId 乱序 ack | §68 必须按最小 batchId ack |
+| 内存暴涨 | 消费慢于生产 | 增大 `memory.buffer.size`；加快消费；Store 背压 §16 |
+| DDL 与 DML 乱序 | 未开 ddl 隔离 | `get.ddl.isolation=true` §56 |
+| MQ 模式无 11111 | `serverMode!=tcp` | §58 `CANAL_WITHOUT_NETTY` |
+
+### 72.3 Client / MQ 层
+
+| 现象 | 可能原因 | 排查 |
+|------|----------|------|
+| 重复消费 | 未 ack 或 rollback 后重连 | 确认 `ack(batchId)`；`rollbackOnConnect` |
+| 集群连错节点 | ZK running 过期 | `ClusterNodeAccessStrategy` §47 |
+| MQ 分区乱序 | 同 key 不同分区 | 检查 `partitionHash` §69 |
+| flat 与 adapter 不兼容 | 两端 flat 不一致 | Server `flatMessage` + adapter `canal.conf.flatMessage` |
+| Kafka 发送失败回滚 | Producer 异常 | `callback.rollback` → Server 重投 §31 |
+
+### 72.4 Admin / 配置层
+
+| 现象 | 可能原因 | 排查 |
+|------|----------|------|
+| Manager 拉不到配置 | Node 未注册 | `autoRegister` §40；`server_polling` |
+| 改配置不生效 | md5 未变 / 未 reload | `ManagerInstanceConfigMonitor` §35 |
+| 整进程频繁重启 | 全局 `canal.properties` 抖动 | `CanalLauncher` 轮询 §66 |
+
+### 72.5 推荐日志关键字
+
+```text
+# Parser
+"begin to find start position" / "dump" / "table parser error"
+
+# Server
+"getWithoutAck successfully" / "ack successfully" / "rollback successfully"
+
+# HA
+"canal is running in node" / "HeartBeat failed"
+
+# MQ
+"Start the MQ work" / "send error" / "commit" / "rollback"
+
+# Adapter
+"Sync failed" / "Outer adapter sync failed" / "turn switch off"
+```
+
+### 72.6 常用诊断命令（运维）
+
+```bash
+# 查看 instance 日志
+tail -f logs/example/example.log
+
+# Admin 拉 Server 状态（11110 协议，或由 admin-ui）
+# 查看 ZK
+ls /otter/canal/destinations/example/running
+
+# Prometheus（若开启）
+curl localhost:11112/metrics | grep canal
+```
+
+---
+
 ## 附录：推荐阅读源码顺序
 
 若希望自行通读 Binlog 监听全链路，建议按以下顺序：
@@ -3866,6 +4173,11 @@ sequenceDiagram
 56. `AbstractCanalClientTest` + example 各 Example — 消费端模板  
 57. `CanalLauncher.main` + `CanalStarter.start` — 进程启动  
 58. `MysqlConnector.negotiate` — MySQL 连接认证  
+59. `MemoryMetaManager` + `getWithoutAck/ack` — batch 与 cursor  
+60. `MQMessageUtils.messagePartition` — MQ 分区 hash  
+61. `DruidDdlParser.parse` — DDL 结构化  
+62. `MysqlDetectingTimeTask` + `doSwitch` — 主备切换  
+63. 本文 §72 — 故障排查清单  
 
 ---
 
