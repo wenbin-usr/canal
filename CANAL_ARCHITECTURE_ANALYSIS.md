@@ -11,7 +11,7 @@
 
 | 目标 | 建议路径 |
 |------|----------|
-| 30 分钟建立全局观 | [§3](#3-整体运行时架构) → [§5](#5-核心数据流水线) → [§6](#6-binlog-监听底层原理重点) → [§103](#103-全链路架构速查一页纸) |
+| 30 分钟建立全局观 | [§3](#3-整体运行时架构) → [§5](#5-核心数据流水线)（含 [§5.6 背压](#56-专题全链路背压与缓冲三层-ring)）→ [§6](#6-binlog-监听底层原理重点) → [§103](#103-全链路架构速查一页纸) |
 | 跟一条 binlog 到消费 | 第二篇（§6–§11）→ 第三篇 Server（§15–§19）→ 第五篇 Client（§21） |
 | 上生产 / 排障 | [§72](#72-全链路故障排查清单) + [§76](#76-性能调优参数速查表) + [§12](#12-关键类索引) |
 | Adapter 同步 | [§13](#13-client-adapter-源码剖析) + 第四篇 Adapter 扩展（§60–§64、§82–§88） |
@@ -36,7 +36,7 @@
 
 **一、总览** — [§1](#1-项目定位与核心思想) · [§2](#2-maven-模块架构) · [§3](#3-整体运行时架构) · [§4](#4-启动与生命周期) · [§12](#12-关键类索引)
 
-**二、Binlog 解析链** — [§5](#5-核心数据流水线) · [§6](#6-binlog-监听底层原理重点) · **[§7](#7-binlog-二进制解析dbsync)（TableMap/ROW/checksum/压缩事务）** · [§8](#8-业务语义转换logeventconvert) · [§9](#9-位点与-meta-双轨管理) · [§10](#10-高可用与容错设计) · [§11](#11-技术亮点与设计亮点) · 延伸：§52 §54 §62 §67 §70 §73 §84 §105 §109
+**二、Binlog 解析链** — [§5](#5-核心数据流水线) · [§6](#6-binlog-监听底层原理重点) · **[§7](#7-binlog-二进制解析dbsync)（§7.4–7.16：ROW/seek/文件/GTID）** · [§8](#8-业务语义转换logeventconvert) · [§9](#9-位点与-meta-双轨管理) · [§10](#10-高可用与容错设计) · [§11](#11-技术亮点与设计亮点) · 延伸：§52 §54 §62 §67 §70 §73 §84 §105 §109
 
 **三、Server 与投递** — [§14](#14-deployer-与-canalcontroller) · [§15](#15-server-消费-api-与-netty) · [§16](#16-sink-与-store-源码) · [§17](#17-位点管理器与-meta-实现) · [§18](#18-过滤与表结构-tsdb) · [§19](#19-mq-投递canalmqstarter) · [§51](#51-abstractcanalinstance-组件装配与生命周期) · [§53](#53-spring-装配default-instancexml-全图) · 延伸：§55–§58 §66 §74 §80–§81 §87 §97
 
@@ -276,6 +276,39 @@ transactionBuffer = new EventTransactionBuffer(transaction -> {
 - `canal.instance.parser.parallelThreadSize`
 - `canal.instance.parser.parallelBufferSize`（默认 256，须为 2 的幂）
 
+### 5.6 专题：全链路背压与缓冲（三层 ring）
+
+Canal 在 Parser 到 Client 之间串联 **三套环形/事务缓冲**，背压从下游逐级传导到上游 socket 读。
+
+```mermaid
+flowchart TB
+    MySQL --> Fetch[DirectLogFetcher 阻塞读]
+    Fetch --> Decode[LogDecoder / Convert]
+    Decode --> TB[EventTransactionBuffer ring]
+    TB -->|flush 整事务| Sink[EntryEventSink tryPut 自旋]
+    Sink --> Store[MemoryEventStore put/get/ack]
+    Store --> Client[TCP getWithoutAck / MQ worker]
+    Client -->|慢| Store
+    Store -->|满| Sink
+    Sink -->|阻塞| TB
+    TB -->|满则 flush| Decode
+```
+
+| 层级 | 组件 | 满/阻塞时行为 | 主要配置 |
+|------|------|---------------|----------|
+| 1 | `EventTransactionBuffer` | `put` 时 `checkFreeSlot` 失败 → **先 flush** 再写入 | `canal.instance.transaction.size`（默认 1024，2^n） |
+| 2 | `EntryEventSink` | `tryPut` 失败 → `applyWait` 自旋，Parser 线程卡住 | `canal.instance.memory.buffer.size`、Store 容量 |
+| 3 | `MemoryEventStoreWithBuffer` | `put` 阻塞在 `notFull.await`；`tryPut` 供 Sink 非阻塞 | 同上 + `batchMode`（ITEMSIZE/MEMSIZE） |
+| 4 | 消费端 | Client/MQ 不 ack → `ackSequence` 不前进，Store 无法回收 | `getBatchSize`、消费速度 |
+
+**位点推进与背压**：解析位点在 **事务 flush** 时 `persistLogPosition`（§9.1），与 Store 无关；Store 满 **不会** 丢 binlog，但会 **减慢** Master 推送（Parser 线程停在 `doSink`）。消费位点在 **Client ack** 后 `updateCursor` + `eventStore.ack`。
+
+**并行模式**：仅 stage1 读 socket；stage4 单线程 `transactionBuffer → sink`。Disruptor ring 满时 `publish` 阻塞，指标 `canal_instance_publish_blocking_time`（§92）。
+
+**MQ 模式**：`CanalMQStarter` 虚拟 client 同样 `getWithoutAck`；Producer `commit` 后才 `ack`（§97），MQ 发送慢会占满 Store。
+
+细节：**§16.3**（Sink）、**§54**（TransactionBuffer）、**§56/§81**（Store）、**§7.16**（压缩事务与 parallel）。
+
 ---
 
 ## 6. Binlog 监听底层原理（重点）
@@ -487,9 +520,12 @@ while (running) {
 
 1. `logPositionManager.getLatestIndexBy(destination)` — 上次持久化的解析位点；
 2. 配置 `masterPosition` / `standbyPosition`；
-3. 按 **时间戳** 在 binlog 中 seek（`MysqlConnection.seek`）；
-4. HA 切换、serverId 变化时的 **fallback 时间回退**（`fallbackIntervalInSeconds`）；
-5. binlog 被 purge：`ServerLogPurgedException` → 时间戳兜底或 `autoResetLatestPosMode`。
+3. 按 **时间戳** 在 binlog 中 seek（`MysqlConnection.seek`，算法见 **§7.14**）；
+4. 位点落在事务中间 → `findTransactionBeginPosition`（§7.14.2）；
+5. HA 切换、serverId 变化时的 **fallback 时间回退**（`fallbackIntervalInSeconds`）；
+6. binlog 被 purge：`ServerLogPurgedException` → 时间戳兜底或 `autoResetLatestPosMode`。
+
+决策树详见 **§104**。
 
 ### 6.8 完整时序图（文件 + 位点模式）
 
@@ -807,35 +843,344 @@ decode 时 body 不含最后 4 字节 CRC；`consume(event_len)` 仍按 **含 ch
 
 v1 事件（`*_V1`）与 v2 成对出现，由 `FormatDescription` 的 `post_header_len` 区分；Canal 在 `LogDecoder` switch 中 **同时处理** 两套 type 常量。
 
-### 7.11 与 §8 的边界
+### 7.12 RowsLogBuffer：行数据二进制格式
+
+`RowsLogBuffer`（`dbsync/.../RowsLogBuffer.java`）实现 MySQL `Rows_log_event::print_verbose_one_row` 语义，把 ROW 事件 body 中的 **packed row** 解为 Java `Serializable`，供 `LogEventConvert.parseOneRow` 填 `CanalEntry.Column`。
+
+#### 7.12.1 单行结构
+
+对 `columns` BitSet 中标记的每一列，一行数据顺序为：
+
+```
+[可选] PARTIAL_UPDATE value_options + partial JSON bitmap   // after 且 partial 时
+null_bitmap：ceil(参与列数/8) 字节，按列顺序标记 NULL
+字段值区：按 TableMap 列顺序，仅对 columns=1 的列依次读取
+```
+
+```74:99:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/event/RowsLogBuffer.java
+    public final boolean nextOneRow(BitSet columns, boolean after) {
+        if (hasOneRow) {
+            int column = 0;
+            for (int i = 0; i < columnLen; i++)
+                if (columns.get(i)) column++;
+            if (after && partial) { /* value_options + json bitmap */ }
+            buffer.fillBitmap(nullBits, column);
+        }
+        return hasOneRow;
+    }
+```
+
+`nextValue()` 先读 `nullBits`，为 NULL 则跳过字节；否则 `fetchValue(type, meta)` 按 **TableMap 里的 MYSQL_TYPE** 解析。
+
+#### 7.12.2 常见类型与字节长度
+
+| MYSQL_TYPE | meta 含义（简述） | 读法 |
+|------------|-------------------|------|
+| `TINY/SHORT/LONG/INT24/LONGLONG` | 定长整数 | `getInt8/16/24/32/64` |
+| `FLOAT/DOUBLE` | 定长浮点 | 4 / 8 字节 IEEE |
+| `NEWDECIMAL` | 高 8 位 precision，低 8 位 scale | `getDecimal(precision, decimals)` |
+| `TIMESTAMP` / `TIMESTAMP2` | v2 的 meta 为小数秒精度 | 秒 + 可选微秒 |
+| `DATETIME` / `DATETIME2` | v1 为 `YYYYMMDDhhmmss` 打包 long | 格式化为字符串 |
+| `DATE` / `TIME` / `TIME2` | 各版本不同 packed 格式 | 见 `fetchValue` switch |
+| `VARCHAR` / `VAR_STRING` / `BLOB` 族 | meta 常表示最大长度 | **length-encoded integer** 前缀 + 数据 |
+| `STRING` | meta≥256 时拆成 ENUM/SET/长 CHAR | 先解析 meta 再读 |
+| `JSON` | MySQL 5.7+ | `JsonConversion` 解析二进制 JSON |
+| `BIT` | meta 含 bit 长度 | 按字节读无符号整数 |
+| `GEOMETRY` | WKB | 长度前缀 + 二进制 |
+
+**字符集**：字符串类用连接阶段 `set names` 得到的 `Charset`（dump 前 `names 'binary'`，TableMap 库表名再按实例 charset 转码，见 `parseTableMapEvent`）。
+
+**性能**：`longCache` / `integerCache` 对小整数装箱做缓存，减轻高频 DML 的 GC。
+
+#### 7.12.3 与 TableMap 的对应关系
+
+- 列下标 `i` 对应 TableMap 中第 `i` 个 `ColumnInfo`（`type` + `meta`）。
+- `LogEventConvert` 再与 **TableMeta.fields[i]** 对齐列名、是否 unsigned、主键标记。
+- `binlog_row_metadata=FULL`（MySQL 8）时 TableMap 带 optional metadata，TSDB 模式下会校验 `fieldMeta` 与 `ColumnInfo` 一致（§73）。
+
+### 7.13 MysqlConnection.seek：快速扫 binlog
+
+`seek` 用于 **按时间戳找位点**、**找事务 BEGIN** 等场景，不是日常 dump。与 `dump` 的差异：
+
+| 对比项 | `dump` | `seek` |
+|--------|--------|--------|
+| 注册 Slave | `sendRegisterSlave` | **不注册**（仅 `sendBinlogDump`） |
+| `LogDecoder` handleSet | 全事件 `UNKNOWN..ENUM_END` | **仅** ROTATE、FORMAT_DESCRIPTION、QUERY、XID（+ GTID 相关） |
+| 目的 | 完整解析业务 Entry | 快速扫描事件头/事务边界，`isSeek=true` 可跳过重量解析 |
+| 压缩事务 | GTID dump 才 iterate | **不** 调用 `processIterateDecode` |
+
+```137:179:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/MysqlConnection.java
+    public void seek(String binlogfilename, Long binlogPosition, String gtid, SinkFunction func) {
+        sendBinlogDump(binlogfilename, binlogPosition);
+        LogDecoder decoder = new LogDecoder();
+        decoder.handle(ROTATE_EVENT);
+        decoder.handle(FORMAT_DESCRIPTION_EVENT);
+        decoder.handle(QUERY_EVENT);
+        decoder.handle(XID_EVENT);
+        // 若传入 gtid，额外 handle GTID_LOG_EVENT / MARIADB GTID_EVENT
+        while (fetcher.fetch()) {
+            event = decoder.decode(fetcher, context);
+            if (!func.sink(event)) break;
+        }
+    }
+```
+
+**为何少 handle ROW 事件**：seek 回调里 `parseAndProfilingIfNecessary(event, true)` 的 `isSeek=true` 对多数 ROW 直接返回 null，只依赖 **event header 的 when/logPos** 推进，减少 CPU。
+
+**起始 offset**：常用 `4L` 跳过 binlog 文件头魔数 `0xfe62696e`（与 `FileLogFetcher` 一致）。
+
+### 7.14 按时间戳与事务头找位点（Parser 侧）
+
+`MysqlEventParser` 在 `findStartPositionInternal` 失败或配置 **timestamp 启动** 时，会走本地扫 binlog 逻辑（依赖 §7.13 `seek`）。
+
+#### 7.14.1 `findByStartTimeStamp`
+
+1. `SHOW MASTER STATUS` 得 **最新** binlog 与 end position。
+2. 从 **最新文件** 向前逐个 `mysql-bin.NNNNNN` 递减。
+3. 对每个文件 `seek(file, 4, gtid, sink)`，在 sink 里：
+   - 用 `event.getWhen() * 1000` 与目标 timestamp 比较；
+   - 记录最后一个 **小于** 目标时间的 `TRANSACTIONBEGIN` 或 `TRANSACTIONEND` 的 `logfileoffset` 作为候选位点；
+   - 若当前事件时间 **≥** 目标时间 → `return false` 停止扫描该文件。
+
+这样保证从 **不晚于目标时刻的事务边界** 开始 dump，避免「timestamp 相同但事务跨秒」丢前半段（注释在 `findTransactionBeginPosition`）。
+
+#### 7.14.2 `findTransactionBeginPosition`
+
+当持久化位点落在 **事务中间某条 ROW** 时：
+
+1. `seek` 从该 journal + position 开始；
+2. 收集所有 `logfileOffset < 目标 position` 的 `TRANSACTIONBEGIN`；
+3. 取最接近的 BEGIN offset 作为真实起点；
+4. 若 BEGIN offset **大于** 配置的 position → 抛错防丢数。
+
+与 §9 解析位点、`needTransactionPosition` 重试（§10.3）联动。
+
+```mermaid
+flowchart TD
+    A[配置/持久化位点] --> B{位点在事务中间?}
+    B -->|是| C[seek + 找 TRANSACTIONBEGIN]
+    B -->|否| D[直接 dump]
+    C --> D
+    E[仅 timestamp] --> F[从最新 binlog 向前 seek]
+    F --> G[找最后一个 txn 边界 < timestamp]
+    G --> D
+```
+
+### 7.15 本地文件：`FileLogFetcher` vs `DirectLogFetcher`
+
+| Fetcher | 数据源 | 包头 |
+|---------|--------|------|
+| `DirectLogFetcher` | 复制流 Socket | MySQL Packet（3+1+n，§109） |
+| `FileLogFetcher` | 本地 `mysql-bin.*` 文件 | 文件头 4 字节 magic，之后 **裸 binlog event** 连续存放 |
+
+```74:80:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/FileLogFetcher.java
+    public void open(File file, final long filePosition) {
+        fin.read(buffer, 0, BIN_LOG_HEADER_SIZE);  // 校验 magic
+        // seek 到 filePosition 后继续 read 填充 LogBuffer
+    }
+```
+
+`LocalBinLogConnection` / RDS OSS 离线回放（§95）走文件或队列输入，**decode 路径与在线相同**（`LogDecoder` + `processIterateDecode`）。区别仅在于无 `COM_REGISTER_SLAVE`、无半同步 ACK。
+
+### 7.16 GTID dump 与压缩事务：实现注意点
+
+`dump(GTIDSet)` 在 `decode` 之后会 `processIterateDecode`：
+
+```237:244:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/MysqlConnection.java
+                List<LogEvent> iterateEvents = decoder.processIterateDecode(event, context);
+                if (!iterateEvents.isEmpty()) {
+                    for (LogEvent itEvent : iterateEvents) {
+                        if (!func.sink(event)) {  // 注意：此处为外层 event，非 itEvent
+                            break;
+                        }
+                    }
+```
+
+**现状**：循环变量为 `itEvent`，但 `sink` 传入的是 **外层 `TRANSACTION_PAYLOAD` 容器事件**，展开后的子 ROW/QUERY **不会** 进入 `sinkHandler`（1.1.9-SNAPSHOT 源码）。因此：
+
+- **并行 Parser**（`MysqlMultiStageCoprocessor` stage2）对 `TRANSACTION_PAYLOAD` 有正确 iterate 分支，**生产若依赖压缩事务，应开启 `canal.instance.parser.parallel=true`**；
+- 仅 GTID 单线程 dump 且 Master 开启 binlog 事务压缩时，可能出现 **消费不到 DML** 的风险。
+
+`dump(file, pos)` 单线程路径 **不调用** `processIterateDecode`（§7.8），压缩事务同样无法展开。
+
+### 7.18 LogBuffer 二进制原语
+
+`LogBuffer` 是 dbsync 读 binlog 字节的统一抽象（`origin`/`position`/`limit`，`consume` 前移）。除 §7.2 的 event 切分外，ROW/TableMap 解析大量依赖下列原语。
+
+#### 7.18.1 Packed Integer（长度编码）
+
+MySQL binlog 中变长字段长度、列数等使用 **Packed Integer**（小端）：
+
+| 首字节 | 含义 |
+|--------|------|
+| 0–250 | 即该数值 |
+| 251 | SQL NULL（`NULL_LENGTH`） |
+| 252 | 后跟 2 字节 uint16 |
+| 253 | 后跟 3 字节 uint24 |
+| 254 | 后跟 8 字节 uint64 |
+
+```1068:1081:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/LogBuffer.java
+    public final long getPackedLong(final int pos) {
+        final int lead = getUint8(pos);
+        if (lead < 251) return lead;
+        switch (lead) {
+            case 251: return NULL_LENGTH;
+            case 252: return getUint16(pos + 1);
+            case 253: return getUint24(pos + 1);
+            default:  return getUint32(pos + 1);  // 254: 8 字节在 getPackedLong() 无参版处理
+        }
+    }
+```
+
+`RowsLogBuffer` 读 VARCHAR/BLOB 时先 `getPackedLong()` 得长度，再读 payload。
+
+#### 7.18.2 其它常用操作
+
+| 方法 | 用途 |
+|------|------|
+| `consume(len)` | `LogDecoder` 消费完整 event |
+| `limit(newLimit)` | checksum 剥掉尾部 4 字节（§7.7） |
+| `duplicate(len)` | `RowsLogEvent` 切出 `rowsBuf` 子缓冲 |
+| `fillBitmap(BitSet, n)` | ROW 行 null 位图 |
+| `getDecimal(p,s)` | `NEWDECIMAL` |
+| `forward(n)` | 跳过 JSON partial 位图等 |
+
+**与 Fetcher 关系**：`DirectLogFetcher` 在 `buffer` 上设置 `origin/limit` 指向当前包内 binlog 切片；`FileLogFetcher` 从文件 `read` 填入同一结构（§7.15）。
+
+---
+
+### 7.17 与 §8 的边界
 
 | 层次 | 模块 | 输入/输出 |
 |------|------|-----------|
-| dbsync | `LogDecoder`、`*LogEvent` | 字节 → **结构化 LogEvent**（仍含 table_id、二进制行） |
+| dbsync | `LogDecoder`、`*LogEvent`、`RowsLogBuffer` | 字节 → **结构化 LogEvent** + 行字段值 |
 | parse | `LogEventConvert` | LogEvent + **TableMeta** → **CanalEntry** Protobuf |
 | parse | `EventTransactionBuffer` | Entry 列表按事务 flush → Sink（§54） |
 
-读懂 §7 后，排查 **TableIdNotFound**、**列数不匹配**、**checksum 乱码**、**压缩事务无数据** 四类问题应优先对照 **TableMap / row_image / dump 路径 / checksum 会话变量**，再查 TSDB 与过滤配置。
+**排障索引**（§7 全章）：
+
+| 现象 | 优先章节 |
+|------|----------|
+| TableIdNotFound | §7.4、§7.14.2 |
+| 列数/类型不匹配 | §7.6、§7.12、§73 |
+| checksum 乱码 | §7.7 |
+| 压缩事务无 DML | §7.8、§7.16 |
+| 按时间启动位点不准 | §7.13、§7.14 |
+| UPDATE 缺 before 列 | §7.6 MINIMAL |
 
 ---
 
 ## 8. 业务语义转换（LogEventConvert）
 
-文件：`parse/.../LogEventConvert.java`。上游 **dbsync** 产出 `LogEvent` 见 **§7**；本节为 **LogEvent → CanalEntry**。
+文件：`parse/.../mysql/dbsync/LogEventConvert.java`。上游 **dbsync** 见 **§7**（含 `RowsLogBuffer` §7.12）；下游 **EventTransactionBuffer** 见 **§5.2、§54**。更细的 switch 与代码行号见 **§62**（延伸）。
 
-`parse(LogEvent)` 按 `eventType` switch：
+```mermaid
+flowchart LR
+    LE[LogEvent] --> P[parse / isSeek]
+    P --> E[CanalEntry.Entry]
+    E --> TB[EventTransactionBuffer.add]
+    TB -->|TRANSACTIONEND| Flush[flush → eventSink]
+```
 
-| Binlog 事件 | Canal Entry |
-|-------------|-------------|
-| `QUERY_EVENT` | DDL / BEGIN（事务开始） |
-| `XID_EVENT` | TRANSACTIONEND |
-| `WRITE/UPDATE/DELETE_ROWS_*` | ROWDATA（含 before/after 列） |
-| `TABLE_MAP_EVENT` | 更新 `TableMetaCache`，不一定产出 Entry |
-| GTID 相关 | 维护 gtid 元数据 |
+### 8.1 parse() 分发与 isSeek
 
-依赖 **TableMetaTSDB**（`enableTsdb`）或内存 `TableMetaCache` 解析列类型、变长字段、JSON 等。
+```97:134:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/dbsync/LogEventConvert.java
+    public Entry parse(LogEvent logEvent, boolean isSeek) {
+        switch (logEvent.getHeader().getType()) {
+            case QUERY_EVENT:       return parseQueryEvent((QueryLogEvent) logEvent, isSeek);
+            case XID_EVENT:         return parseXidEvent((XidLogEvent) logEvent);
+            case TABLE_MAP_EVENT:   parseTableMapEvent(...); return null;
+            case WRITE/UPDATE/DELETE_ROWS_*: return parseRowsEvent(...);
+            case GTID_LOG_EVENT:    return parseGTIDLogEvent(...);
+            case HEARTBEAT_LOG_EVENT: return parseHeartbeatLogEvent(...);
+        }
+    }
+```
 
-过滤在解析阶段完成：`AviaterRegexFilter` 对 schema.table 匹配；支持 field 级黑白名单。
+| isSeek | 场景 | 行为 |
+|--------|------|------|
+| `true` | `MysqlConnection.seek` 扫位点（§7.13） | 多数 ROW 不解析，仅用 header 时间/位点 |
+| `false` | 正常 dump | 完整生成 Entry |
+
+| LogEvent | EntryType | 备注 |
+|----------|-----------|------|
+| QUERY（`BEGIN`） | TRANSACTIONBEGIN | 含 `threadId` |
+| XID | TRANSACTIONEND | InnoDB commit |
+| ROWS | ROWDATA | `RowChange` 在 `storeValue` |
+| TABLE_MAP | — | 只 `parseTableMapEvent`，返回 null |
+| GTID / HEARTBEAT | 特殊 Entry | 位点、保活 |
+
+### 8.2 parseQueryEvent：DDL、BEGIN 与 Druid
+
+- 识别 `BEGIN` → `TRANSACTIONBEGIN`；`COMMIT` 在 ROW 模式常由 `XID` 表达。
+- DDL（CREATE/ALTER/DROP…）：`RowChange.isDdl=true`，`sql` 填原始语句；若 `canal.instance.filter.druid.ddl=true`，走 **DruidDdlParser**（§70）得到 `DdlResult`，调用 `tableMetaCache.apply` 更新 TSDB（§26）。
+- **表级过滤**：`AviaterRegexFilter` 对 `schema.table` 匹配，不匹配则返回 null（§18、§63）。
+- **XA**：解析 XA START/END 对应 `EventType.XACOMMIT` / `XAROLLBACK`。
+
+### 8.3 parseRowsEvent 与 Header 构造
+
+流程（与 §7.5 衔接）：
+
+1. `parseRowsEventForTableMeta`：用 `event.getTable()`（TableMap）+ `TableMetaCache` 取 **该时刻** 表结构；RDS/PolarX 心跳表可 mock meta。
+2. `filterRows` 或表 meta 为空 → 返回 null（静默跳过）。
+3. `RowsLogBuffer` 循环 `nextOneRow` + `parseOneRow` 组装 `RowChange`。
+4. `createHeader`：填入 `schemaName`、`tableName`、`eventType`（INSERT/UPDATE/DELETE）、`executeTime`、`logfileName`、`logfileOffset`（`logPos - eventLen`）、`serverId`、`gtid`。
+5. `Entry.newBuilder().setEntryType(ROWDATA).setStoreValue(rowChange.toByteString())`。
+
+`rowsCount` 写入 Header，供下游统计；一个 ROW binlog 事件可含 **多行** `RowData`。
+
+### 8.4 parseOneRow：Column 构建要点
+
+`parseOneRow` 对每个参与列（`columns` BitSet 为 1）：
+
+```727:819:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/dbsync/LogEventConvert.java
+            buffer.nextValue(name, i, info.type, info.meta, isBinary);
+            // isBinary：VARBINARY/BINARY 不做 charset 转码（issue #66）
+            // unsigned：负数字节按最大值补偿为十进制字符串，并上调 sqlType 量级
+            // BLOB vs TEXT：binlog 均为 BLOB 类型码，按 TableMeta 列类型判断是否按 CLOB 解析
+            columnBuilder.setValue(String.valueOf(...));
+```
+
+| 机制 | 说明 |
+|------|------|
+| **列过滤** | `fieldFilterMap` / `fieldBlackFilterMap`（`canal.instance.filter.field`） |
+| **online DDL** | `columnInfo.length > fields.size()` → 强制 `getTableMeta` 刷新；仍不一致则 `filterTableError` 或抛错 |
+| **MySQL 8 metadata** | `existOptionalMetaData` + TSDB 时校验 `ColumnInfo` 与 `FieldMeta` 名/unsigned/nullable |
+| **RDS 隐式主键列** | `__#alibaba_rds_row_id#__` 跳过 binlog 最后一列 LONGLONG |
+
+最终值一律 **`Column.value` 字符串**（含数字、时间、十六进制 blob），Client/Adapter 再按 `sqlType` 转换。
+
+### 8.5 过滤双阶段
+
+| 阶段 | 位置 | 对象 |
+|------|------|------|
+| Parser | `LogEventConvert` / `AbstractEventParser` | QUERY/DDL、部分 ROW 在 parse 前即丢弃 |
+| Sink | `EntryEventSink.doFilter` | 仅对 `ROWDATA` 再滤 `schema.table`（§16、§55） |
+
+表不在白名单：**不产生 Entry**，不占 Store；已在 TransactionBuffer 的 Entry 在 Sink 阶段仍可能被滤掉。
+
+### 8.6 进入 TransactionBuffer 与位点
+
+`AbstractEventParser.sinkHandler`：
+
+```207:221:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/AbstractEventParser.java
+    CanalEntry.Entry entry = parseAndProfilingIfNecessary(event, false);
+    if (entry != null) {
+        transactionBuffer.add(entry);
+        this.lastPosition = buildLastPosition(entry);
+    }
+```
+
+`transactionBuffer` flush 时 `consumeTheEventAndProfilingIfNecessary` → `eventSink.sink(List<Entry>)` → `persistLogPosition`（事务级，§9.1）。
+
+**心跳**：`HEARTBEAT` Entry 在 buffer 内立即 flush；独立 SQL 心跳线程不经过 binlog（§10.4）。
+
+### 8.7 与 §62 的分工
+
+| 章节 | 内容 |
+|------|------|
+| **§8（本节）** | 语义转换流程、Column 规则、过滤与事务衔接 |
+| **§62** | `parse()` switch 源码索引、与 TSDB 流程图 |
 
 ---
 
@@ -867,6 +1212,91 @@ FailbackLogPositionManager(
 1. 从 `eventStore.tryGet` 取事件；
 2. `metaManager.addBatch` 记录 `[startPosition, endPosition]`；
 3. Client `ack(batchId)` → `eventStore.ack` 释放 ring buffer。
+
+更细的 Store 三指针见 **§81**；ZK 刷盘见 **§59、§86**。
+
+### 9.3 getWithoutAck / ack / rollback 时序
+
+```mermaid
+sequenceDiagram
+    participant C as Client / MQ worker
+    participant S as CanalServerWithEmbedded
+    participant M as MetaManager
+    participant St as EventStore
+
+    C->>S: getWithoutAck(batchSize)
+    Note over S: synchronized(canalInstance)
+    S->>M: getLastestBatch? / getCursor
+    S->>St: tryGet(start, batchSize)
+    S->>M: addBatch → batchId
+    S-->>C: Message(batchId, entries)
+
+    C->>S: ack(batchId)
+    S->>M: removeBatch(batchId) 必须最小 batchId
+    S->>M: updateCursor(ack位点)
+    S->>St: ack(endPosition, endSeq)
+```
+
+**`synchronized (canalInstance)`**：保证同一 destination 上 **meta 与 store 读取顺序一致**（源码注释：避免先拿到 meta 再拿到更旧数据）。
+
+#### 第一次 get vs 连续 get
+
+| 情况 | `start` 位点来源 |
+|------|------------------|
+| 尚无未 ack batch | `metaManager.getCursor()`；cursor 为空则用 `eventStore.getFirstPosition()` |
+| 已有未 ack batch | `getLastestBatch().getStart()` 的 **end** 继续往后读（流式拉取同一消费会话） |
+
+因此 Client 可 **多次 getWithoutAck 再统一 ack**，或每批立即 ack；未 ack 的 batch 会留在 Meta 中直至 `removeBatch`。
+
+#### ack 规则（顺序消费）
+
+```147:156:meta/src/main/java/com/alibaba/otter/canal/meta/MemoryMetaManager.java
+        public synchronized PositionRange removePositionRange(Long batchId) {
+            Long minBatchId = Collections.min(batches.keySet());
+            if (!minBatchId.equals(batchId)) {
+                throw new CanalMetaManagerException("batchId is not the firstly");
+            }
+            return batches.remove(batchId);
+        }
+```
+
+**必须按 batchId 从小到大 ack**（先提交最小 id），否则抛 `CanalMetaManagerException`，防止中间 batch 被跳过导致 **Store 提前 ack 释放** 而客户端尚未处理。
+
+ack 成功后：
+
+```425:437:server/src/main/java/com/alibaba/otter/canal/server/embedded/CanalServerWithEmbedded.java
+        canalInstance.getMetaManager().updateCursor(clientIdentity, positionRanges.getAck());
+        canalInstance.getEventStore().ack(positionRanges.getEnd(), positionRanges.getEndSeq());
+```
+
+- **cursor**：用 `PositionRange.ack`（非 end），保证落在事务结束/DDL（§81.7）；`PeriodMixedMetaManager` 延迟刷 ZK（§59）。
+- **Store ack**：用 `end` + `endSeq` 匹配 ring slot（§81.4–§81.7）。
+
+#### rollback
+
+| API | Meta | Store |
+|-----|------|-------|
+| `rollback(clientIdentity)` | `clearAllBatchs` | `eventStore.rollback()` 回到上次 ack |
+| `rollback(clientIdentity, batchId)` | `removeBatch(batchId)` | 仍调用 **整表** `rollback()`（TODO：未精确回滚到 batch 位点） |
+
+MQ 模式 Producer 失败时 `callback.rollback(batchId)`（§97）走后者，Store 中 **该 batch 之后** 的 get 数据也会被回滚可见。
+
+#### 空包
+
+`Message(-1)`：`batchId=-1` 且 entries 为空，**不** `addBatch`，避免无意义的 Meta 记录（§15）。
+
+### 9.4 解析位点 vs 消费位点（再述）
+
+| 轨道 | 管理者 | 推进时机 | 典型用途 |
+|------|--------|----------|----------|
+| **解析位点** | `CanalLogPositionManager` | 事务 flush 后 `persistLogPosition` | Parser 重启从哪继续拉 binlog |
+| **消费位点** | `CanalMetaManager.cursor` | Client `ack` 后 `updateCursor` | 客户端/MQ 消费进度 |
+
+`FailbackLogPositionManager` 重启时若内存位点丢失，可从 **Meta 最小未 ack** 或 cursor 回退（§17），缩小重复消费窗口。
+
+### 9.5 与 §5.6 背压的关系
+
+消费慢 → 多个 batch 堆积在 Meta + Store `getSequence` 前移而 `ackSequence` 停滞 → ring 满 → §5.6 所述 Parser 背压。监控可看 **未 ack batch 列表** `listBatchIds` 与 Store 三指针差值。
 
 ---
 
@@ -1113,7 +1543,53 @@ FailbackLogPositionManager(
 
 `writeOut`：`MessageUtil.flatMessage2Dml` → 组间并行、组内 **串行** `adapter.sync`；成功才 `ack`。
 
-### 13.5 TCP 消费：`CanalTCPConsumer`
+### 13.5 CanalEntry → Dml 映射（与 §8 衔接）
+
+Adapter 不直接操作 `LogEvent`，统一经 **Message / CommonMessage** 转为 `Dml`（`client-adapter/common/.../MessageUtil.java`）。
+
+#### 13.5.1 TCP：`parse4Dml(Message)`
+
+```17:128:client-adapter/common/src/main/java/com/alibaba/otter/canal/client/adapter/support/MessageUtil.java
+    for (CanalEntry.Entry entry : message.getEntries()) {
+        if (TRANSACTIONBEGIN || TRANSACTIONEND) continue;
+        RowChange rowChange = RowChange.parseFrom(entry.getStoreValue());
+        dml.setDatabase(entry.getHeader().getSchemaName());
+        dml.setTable(entry.getHeader().getTableName());
+        dml.setType(eventType.toString());  // INSERT/UPDATE/DELETE/CREATE...
+        dml.setEs(entry.getHeader().getExecuteTime());
+        for (RowData rowData : rowChange.getRowDatasList()) {
+            // DELETE → beforeColumns；INSERT/UPDATE → afterColumns
+            for (Column column : columns) {
+                row.put(name, JdbcTypeUtil.typeConvert(table, name, value, sqlType, mysqlType));
+                if (column.getUpdated()) updateSet.add(name);
+            }
+            // UPDATE：beforeColumns 中仅 column.updated=true 的列进入 old
+        }
+    }
+```
+
+| CanalEntry（§8） | Dml 字段 |
+|------------------|----------|
+| `Header.schemaName/tableName` | `database` / `table` |
+| `Header.executeTime` | `es` |
+| `RowChange.eventType` | `type` |
+| `RowChange.isDdl` + `sql` | `isDdl` / `sql` |
+| `Column.name/value/sqlType/mysqlType/isKey` | `data[]` Map + `pkNames` |
+| `Column.updated` | UPDATE 时决定是否进入 `old[]` |
+
+**与 §8.4 差异**：`Column.value` 在 Adapter 层经 `JdbcTypeUtil.typeConvert` 转为 **Java 对象**（`Integer`、`BigDecimal`、`byte[]` 等），供 RDB/ES 拼 SQL。
+
+#### 13.5.2 MQ flat：`flatMessage2Dml`
+
+`CommonMessage` 字段与 `FlatMessage`（§45）对齐；`data`/`old` 已是 **字符串 Map**，`flatMessage2Dml` 直接赋值，类型转换在 Server 侧 `MQMessageUtils` 或 Consumer 反序列化时完成。
+
+#### 13.5.3 分组写入
+
+`writeOut` 按 **库表** 分组：组间 `ExecutorService` 并行，组内对多个 `OuterAdapter` **串行** `sync(dml)`，保证同一目标表写入顺序；全部成功才 `canalMsgConsumer.ack()`（对应 Server `batchId`）。
+
+### 13.6 TCP 消费：`CanalTCPConsumer`
+
+（原 §13.5 编号顺延）
 
 ```62:98:connector/tcp-connector/src/main/java/com/alibaba/otter/canal/connector/tcp/consumer/CanalTCPConsumer.java
     public void connect() {
@@ -1137,29 +1613,19 @@ FailbackLogPositionManager(
     }
 ```
 
-### 13.6 RDB 落地（示例）
+### 13.7 RDB 落地（示例）
 
-`RdbAdapter.init` → `ConfigLoader.load("rdb")` 读 `conf/rdb/*.yml`，`match(outerAdapterKey)` 过滤配置。
+`RdbAdapter`：`@SPI("rdb")`，`init` 加载 `conf/rdb/*.yml`，`outerAdapter.sync(List<Dml>)` 委托 `RdbSyncService`。
 
-`RdbSyncService.sync`：按 `destination[_groupId]_db-table` 查映射；`concurrent=true` 时 `pkHash` 分区到多 `BatchExecutor` 线程提交 JDBC batch。
+**主读** [§60 RDB Adapter：SQL 生成与批量写入](#60-rdb-adaptersql-生成与批量写入)（INSERT/UPDATE/DELETE、`appendDmlPartition`、BatchExecutor）。
 
-```154:184:client-adapter/rdb/src/main/java/com/alibaba/otter/canal/client/adapter/rdb/service/RdbSyncService.java
-    public void sync(Map<String, Map<String, MappingConfig>> mappingConfig, List<Dml> dmls, Properties envProperties) {
-        sync(dmls, dml -> {
-            if (dml.getIsDdl() != null && dml.getIsDdl()) {
-                columnsTypeCache.remove(...);
-                return false;
-            }
-            configMap = mappingConfig.get(destination + "_" + database + "-" + table);
-            for (MappingConfig config : configMap.values()) {
-                appendDmlPartition(config, dml);
-            }
-            return true;
-        });
-    }
-```
+要点：
 
-### 13.7 ES 落地（与 RDB 差异）
+- 映射键：`{destination}_{db}-{table}`（MQ 模式 `{destination}-{groupId}_{db}-{table}`）。
+- DDL：清 `columnsTypeCache`，不走 DML 分区队列。
+- 镜像库：`RdbMirrorDbSyncService` 整库 DDL+DML（§64）。
+
+### 13.8 ES 落地（与 RDB 差异）
 
 ```76:87:client-adapter/escore/src/main/java/com/alibaba/otter/canal/client/adapter/es/core/ESAdapter.java
     public void sync(List<Dml> dmls) {
@@ -1174,7 +1640,7 @@ FailbackLogPositionManager(
 
 跳过 DDL；多表 JOIN 场景在 `ESSyncService.insert` 中按主表/从表回查源库 SQL 组文档后批量写 ES。
 
-### 13.8 SyncSwitch 与 REST
+### 13.9 SyncSwitch 与 REST
 
 `SyncSwitch.off(destination)` 使 `BooleanMutex` 为 false，`AdapterProcessor` 在 `get()` 阻塞暂停同步；ZK 模式写 `/sync-switch/{destination}`。
 
@@ -3315,6 +3781,66 @@ message Entry {
 
 适用场景：宽表、大行、高 QPS 时把 **CPU 密集的 Row 解析** 从 IO 线程剥离；代价是内存占用与复杂度上升。
 
+### 50.3 Disruptor 流水线拓扑
+
+`RingBuffer<MessageEvent>` 单生产者（dump 线程 `publish`），三消费者链：
+
+```mermaid
+flowchart LR
+    P[dump publish] --> RB[(RingBuffer)]
+    RB --> S2[SimpleParserStage 单线程]
+    S2 --> S3[DmlParserStage x N WorkerPool]
+    S3 --> S4[SinkStoreStage 单线程]
+    S4 --> TB[EventTransactionBuffer]
+```
+
+| Stage | 类 | 线程 | 输入 → 输出 |
+|-------|-----|------|-------------|
+| 1 网络 | `MysqlConnection.dump` | dump 线程 | socket → `publish(LogBuffer)` |
+| 2 基本解析 | `SimpleParserStage` | `stageExecutor` 1 线程 | `LogBuffer` → `LogEvent`；TABLE_MAP/DDL 在此 `logEventConvert.parse`；ROW 只 `parseRowsEventForTableMeta` |
+| 3 深度解析 | `DmlParserStage` | `parserThreadCount` 线程 | `parseRowsEvent` / iterate 子事件 → `CanalEntry.Entry` |
+| 4 投递 | `SinkStoreStage` | `stageExecutor` 1 线程 | `transactionBuffer.add`；半同步 `sendSemiAck` |
+
+**Gating**：`simpleParserStage` → `workerPool` → `sinkStoreStage` 序列依赖，保证 **Entry 顺序进入 TransactionBuffer** 与单线程 dump 语义一致。
+
+### 50.4 MessageEvent 状态机
+
+`MessageEvent` 在 ring 槽位上携带：
+
+| 字段 | 阶段 | 含义 |
+|------|------|------|
+| `buffer` | publish | 原始 binlog 切片（stage2 decode 后清空） |
+| `event` | stage2 | `LogEvent` |
+| `table` / `iterateTables` | stage2 | ROW 的 `TableMeta` |
+| `needDmlParse` | stage2→3 | 是否进入 DmlParserStage |
+| `needIterate` | stage2 | `TRANSACTION_PAYLOAD` 展开 |
+| `iterateEvents` / `iterateEntrys` | stage2/3 | 压缩事务多事件 |
+| `entry` | stage3→4 | 最终 `CanalEntry.Entry` |
+
+**压缩事务**（并行路径正确实现）：
+
+```268:278:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/MysqlMultiStageCoprocessor.java
+                if (eventType == LogEvent.TRANSACTION_PAYLOAD_EVENT) {
+                    List<LogEvent> deLogEvents = decoder.processIterateDecode(logEvent, context);
+                    event.setNeedIterate(true);
+                    event.setIterateEvents(deLogEvents);
+```
+
+```408:412:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/MysqlMultiStageCoprocessor.java
+                if (event.isNeedIterate()) {
+                    for (CanalEntry.Entry entry : event.getIterateEntrys()) {
+                        transactionBuffer.add(entry);
+                    }
+```
+
+与 §7.16 GTID **单线程** `sink(外层event)` 缺陷对比：生产开启 binlog 事务压缩时应 **parallel=true**。
+
+### 50.5 publish 背压与 filterDml*
+
+`publish` 在 `InsufficientCapacityException` 时 `applyWait`（同 EntryEventSink，§16.3），累计 `eventsPublishBlockingTime`。
+
+构造参数 `filterDmlInsert/Update/Delete`：在 stage2 对对应 ROW 类型 **不取 TableMeta、不标记 needDmlParse**，实现 **粗粒度 DML 类型过滤**（早于 `LogEventConvert` 完整解析）。
+
 ---
 
 ## 51. AbstractCanalInstance 组件装配与生命周期
@@ -3708,24 +4234,85 @@ Admin 端口 11110 与 `CanalController` 在两种模式下均会启动（若配
 
 ## 59. PeriodMixedMetaManager 元数据刷新
 
-`default-instance.xml` 默认 Meta 实现：**内存 + ZK 定时合并**。
+`default-instance.xml` 默认 Meta Bean：`PeriodMixedMetaManager`（**非** `MixedMetaManager`）。
 
-```26:30:meta/src/main/java/com/alibaba/otter/canal/meta/PeriodMixedMetaManager.java
- * 1. 去除 batch 数据刷新到 zk，切换时 batch 可忽略
- * 2. cursor 定时刷新，合并多次 ack 请求
+```50:52:deployer/src/main/resources/spring/default-instance.xml
+	<bean id="metaManager" class="com.alibaba.otter.canal.meta.PeriodMixedMetaManager">
+		<property name="zooKeeperMetaManager" ref="zkMetaManager" />
+		<property name="period" value="${canal.zookeeper.flush.period:1000}" />
 ```
 
-| 数据 | 内存 | ZK 持久化 |
-|------|------|-----------|
-| subscribe / filter | MemoryMetaManager | ZK |
-| cursor（消费位点） | 内存 + 脏标记 | 每 `period` ms 批量 flush |
-| batch mark（未 ack） | 启动时从 ZK 加载 | 运行期 **不写 ZK**（切换可重放） |
+### 59.1 设计目标（源码注释）
 
-`canal.zookeeper.flush.period` 默认 1000ms。与 `ZooKeeperMetaManager`（§25）配合，cursor 路径见 §41。
+```26:30:meta/src/main/java/com/alibaba/otter/canal/meta/PeriodMixedMetaManager.java
+ * 1. 去除 batch 数据刷新到 zk，切换时 batch 可忽略，重新从头开始获取
+ * 2. cursor 的更新，启用定时刷新，合并多次请求
+```
+
+| 数据 | 内存 | ZK 持久化 | 说明 |
+|------|------|-----------|------|
+| `subscribe` / filter | ✓ | 立即异步 `executor.submit` | 变更频率低 |
+| `cursor` | ✓ | **定时** flush（`period` ms） | `updateCursor` 只打脏标记 |
+| `batch`（未 ack） | ✓ | **仅启动时** `listAllBatchs` 灌入 | 运行期 `addBatch` **不** 写 ZK |
+
+与 **`MixedMetaManager`**（每次 `addBatch/removeBatch` 异步写 ZK）对比：Period 版减少 ZK 写放大，Server 切换后未 ack batch 可丢弃，依赖 Client 重放。
+
+### 59.2 cursor 定时刷盘流程
+
+```120:123:meta/src/main/java/com/alibaba/otter/canal/meta/PeriodMixedMetaManager.java
+    public void updateCursor(ClientIdentity clientIdentity, Position position) {
+        super.updateCursor(clientIdentity, position);
+        updateCursorTasks.add(clientIdentity);
+    }
+```
+
+```78:91:meta/src/main/java/com/alibaba/otter/canal/meta/PeriodMixedMetaManager.java
+        executor.scheduleAtFixedRate(() -> {
+            for (ClientIdentity clientIdentity : tasks) {
+                updateCursorTasks.remove(clientIdentity);
+                zooKeeperMetaManager.updateCursor(clientIdentity, getCursor(clientIdentity));
+            }
+        }, period, period, TimeUnit.MILLISECONDS);
+```
+
+```mermaid
+sequenceDiagram
+    participant S as Server ack
+    participant M as PeriodMixedMetaManager
+    participant ZK as ZooKeeperMetaManager
+
+    S->>M: updateCursor(ack位点)
+    M->>M: 内存 cursors 更新 + 加入 updateCursorTasks
+    Note over M: 最多延迟 period ms
+    M->>ZK: updateCursor 合并写
+```
+
+**风险**：进程 crash 在 flush 前，cursor 可能 **落后** 最后一次 ack 最多 `period` 毫秒对应的 binlog；重启后从 ZK 旧 cursor 消费会 **重复** 少量数据（at-least-once）。
+
+### 59.3 启动时恢复
+
+`start()` 时：
+
+- `destinations` → 从 ZK `listAllSubscribeInfo` 计算 map；
+- `cursors` → 懒加载 `getCursor`，无则 `nullCursor` 占位；
+- `batches` → 从 ZK `listAllBatchs` 重建 `MemoryClientIdentityBatch`。
+
+与 §9.3 **ack 顺序**、§81 **Store rollback** 配合：HA 切换节点后，内存 batch 可能与 Store 不一致，常配合 `rollback` 或 Client 重订阅。
+
+### 59.4 配置
+
+| 键 | 默认 | 作用 |
+|----|------|------|
+| `canal.zookeeper.flush.period` | 1000 | cursor 刷 ZK 间隔（ms） |
+| `canal.zkServers` | — | 启用 ZK Meta；空则退化为纯 `MemoryMetaManager` 行为 |
+
+路径：`/otter/canal/destinations/{dest}/{clientId}/cursor`（§41、§99）。
 
 ---
 
 ## 60. RDB Adapter：SQL 生成与批量写入
+
+> **主读本节**；§13.7 为 Adapter 链路口；§13.5 的 `Dml` 字段来源见该节。
 
 模块：`client-adapter/rdb`，`@SPI("rdb")`。
 
@@ -3763,9 +4350,45 @@ Admin 端口 11110 与 `CanalController` 在两种模式下均会启动（若配
     }
 ```
 
-UPDATE/DELETE 用 **主键列** 构造 WHERE；`BatchExecutor` 单连接 `autoCommit=false`，多句 `execute` 后一次 `commit()`。
+### 60.4 UPDATE / DELETE 与主键 WHERE
 
-### 60.4 BatchExecutor
+**UPDATE**（`RdbSyncService.update`）：
+
+1. 要求 `dml.data` 与 `dml.old` 均非空（对应 §13.5 中 `column.updated=true` 的 old 列）。
+2. `SET` 子句：仅对 **出现在 old 中的源列** 生成 `targetCol=?`，值取自 **data**（变更后）。
+3. `WHERE`：`appendCondition` 用 **主键列**（`dbMapping` 配置）从 data/old 取值。
+
+**DELETE**：`WHERE` 同样只按主键；`data` 在 DELETE 场景来自 `beforeColumns`（§13.5）。
+
+**TRUNCATE**：映射到目标表 `TRUNCATE TABLE`（无行级条件）。
+
+若 `binlog_row_image=MINIMAL` 且 old 仅含主键，UPDATE 的 SET 可能 **只更新主键列本身** 或 `hasMatched=false` 打 warn 跳过——需在 mapping 或源库 row image 上规划。
+
+### 60.5 appendDmlPartition 与并发
+
+```195:220:client-adapter/rdb/src/main/java/com/alibaba/otter/canal/client/adapter/rdb/service/RdbSyncService.java
+    public void appendDmlPartition(MappingConfig config, Dml dml) {
+        List<SingleDml> singleDmls = SingleDml.dml2SingleDmls(dml);  // 多行拆单行
+        int threads = config.getConcurrentThreads();
+        for (SingleDml singleDml : singleDmls) {
+            int hash = pkHash(singleDml.getData(), singleDml.getOld(), pkNames) % threads;
+            dmlsPartition.get(hash).add(singleDml);
+        }
+    }
+```
+
+| 配置 | 行为 |
+|------|------|
+| `concurrent: false` | 单 `BatchExecutor`，顺序 `sync` |
+| `concurrent: true` | `threads` 个队列 + 线程池，**同主键 hash 串行** 保证行级顺序 |
+
+每批 `dmls` 处理完对各分区 `commit()`；失败抛错 → `AdapterProcessor` 不 ack（§13.4）。
+
+### 60.6 主键冲突与 skipDupException
+
+`insert` 捕获 `SQLIntegrityConstraintViolationException`：若 `skipDupException=true` 忽略重复键，否则抛出。用于 **幂等同步** 场景。
+
+### 60.7 BatchExecutor
 
 ```54:74:client-adapter/rdb/.../BatchExecutor.java
     public void execute(String sql, List<Map<String, ?>> values) {
@@ -3827,6 +4450,8 @@ UPDATE/DELETE 用 **主键列** 构造 WHERE；`BatchExecutor` 单连接 `autoCo
 ---
 
 ## 62. LogEventConvert：LogEvent → Entry
+
+> **主读 [§8](#8-业务语义转换logeventconvert)**；本节保留源码行号与 TSDB 流程图索引。
 
 `LogEventConvert` 是 binlog 五层中 **第四层→第五层** 的核心：`LogEvent`（dbsync 二进制对象）→ `CanalEntry.Entry`（Protobuf）。
 
@@ -4155,6 +4780,8 @@ sequenceDiagram
 ---
 
 ## 68. MemoryMetaManager 与 batch 语义
+
+> **主读** [§9.3 getWithoutAck / ack / rollback 时序](#93-getwithoutack--ack--rollback-时序)；本节为数据结构索引。
 
 `MemoryMetaManager` 是 Meta 的 **纯内存实现**，`PeriodMixedMetaManager`（§59）在其上增加 ZK 定时刷 cursor。
 
@@ -5098,6 +5725,65 @@ ackSequence ←—— ack 后释放 slot ——→ getSequence ←—— 可读 
 | rollback | `getSequence = ackSequence` | 删未 ack batch |
 
 保证 **meta 与 store 顺序一致**（`getWithoutAck` 对 `canalInstance` 加 `synchronized`）。
+
+### 81.7 PositionRange：start / ack / end / endSeq
+
+`doGet` 组装返回给 Server 的区间（`store/.../MemoryEventStoreWithBuffer.doGet`）：
+
+```332:348:store/src/main/java/com/alibaba/otter/canal/store/memory/MemoryEventStoreWithBuffer.java
+        range.setStart(CanalEventUtils.createPosition(entrys.get(0)));
+        range.setEnd(CanalEventUtils.createPosition(entrys.get(entrys.size() - 1)));
+        range.setEndSeq(end);
+        for (int i = entrys.size() - 1; i >= 0; i--) {
+            Event event = entrys.get(i);
+            if ((TRANSACTIONBEGIN && gtid empty) || TRANSACTIONEND || isDdl(eventType)) {
+                range.setAck(CanalEventUtils.createPosition(event));
+                break;
+            }
+        }
+```
+
+| 字段 | 含义 | ack 时使用 |
+|------|------|------------|
+| `start` | 本 batch **第一条** Event 位点 | 下次 `get` 续读（`getLastestBatch`） |
+| `end` | 本 batch **最后一条** Event 位点 | `eventStore.ack(end, endSeq)` 匹配 slot |
+| `endSeq` | ring 上最后一条的 **sequence** | `cleanUntil` 精确扫到 seq |
+| `ack` | 本 batch 内 **可安全提交 cursor** 的位点 | `metaManager.updateCursor(ack)` |
+
+**为何单独 ack 字段**：batch 可能含多条 Entry，但 cursor 应落在 **完整事务结束** 或 DDL 边界，避免 GTID 模式下只 ack 到 `TRANSACTIONBEGIN`（无 gtid 的 begin）导致下次订阅丢最后一个事务（源码注释）。
+
+**GTID**：优先以 `TRANSACTIONEND` 或带 gtid 的边界作为 `ack`；普通 BEGIN（无 gtid）不作为 cursor 落点。
+
+```mermaid
+flowchart LR
+    subgraph batch
+        E1[Entry 1]
+        E2[ROW...]
+        E3[TRANSACTIONEND]
+    end
+    E1 --> start
+    E3 --> end
+    E3 --> ack
+    E3 --> cursor更新
+```
+
+### 81.8 ddlIsolation 与 get 截断
+
+`canal.instance.store.ddlIsolation=true` 时，`doGet` 遇到 DDL Event：
+
+- 若 batch 内 **尚无 DML**，本批只含该 DDL；
+- 若已有 DML，**不包含** 当前 DDL，下次 get 再取。
+
+避免大 DDL 与大量 DML 混在同一 `Message`，方便下游按批处理 DDL。
+
+### 81.9 tryPut vs put（Sink 路径）
+
+| 方法 | 调用方 | Store 满时 |
+|------|--------|------------|
+| `put` | 阻塞 API | `notFull.await()` |
+| `tryPut` | `EntryEventSink` | 立即返回 false，Parser 自旋（§16.3） |
+
+Server 侧 `get` 使用 `tryGet`，客户端超时可部分返回（`doGet` 时间到有多少取多少）。
 
 ---
 
@@ -6809,8 +7495,17 @@ MySQL → Parser → Store
 | 全局 / 一页纸 | §103、§3、§5 | 导读六篇表 |
 | binlog 怎么读 | §6–§8 | **§7**（dbsync 深度）、§105、§109 |
 | TableMap/ROW/压缩事务 | §7.4–§7.8 | §62、§73 |
+| RowsLogBuffer 类型解析 | §7.12 | §8 |
+| seek / 按时间找位点 | §7.13–§7.14 | §24、§104 |
+| 压缩事务 GTID sink | §7.16 | §50 parallel |
+| LogEventConvert / Column | §8 | §62 |
+| 全链路背压 | §5.6 | §9.5、§16.3、§54、§81 |
+| Meta batch/ack | §9.3 | §68、§81、§97 |
+| Disruptor 并行 | §50.3–§50.5 | §5.5、§7.16 |
+| Entry → Dml | §13.5 | §8、§45 |
+| LogBuffer packed 整数 | §7.18 | §7.12 |
 | 客户端协议 | §37–§38 | §80 |
-| Store 背压 | §16.3 | §55、§81 |
+| Store 背压 / PositionRange | §81.7–§81.9 | §16.3、§9.3 |
 | ZK HA | §41.4 | §99 |
 | MQ 投递 / 选型 | §19、§31.4 | §97、§106 |
 | Adapter | §13 | §82、§102 |
@@ -7232,6 +7927,10 @@ flowchart LR
 
 大包 `netlen == 0xFFFFFF` 时循环拼接，保证 **单个 LogEvent 不被截断**。
 
+### 109.5 与本地文件读取的差异
+
+在线复制流必须经过 **MySQL Packet 拆包**（§109.1）；本地 `mysql-bin.*` 由 `FileLogFetcher` 直接读 **裸 event 字节**（§7.15），无 mark=255/254 语义。两者汇入同一 `LogDecoder`。
+
 ---
 
 ## 110. EntryEventSink 背压（已归并）
@@ -7285,7 +7984,15 @@ flowchart LR
 | Session / Netty | §15 | §80、§87 | |
 | 多流 / RDS | §33 | §91、§95 | |
 | Adapter 总览 | §13 | §44、§60–§64、§102 | |
-| Binlog 拉流 / dbsync | **§7**（§7.4–§7.8） | §6、§105、§109、§67、§62 | TableMap、ROW、checksum、压缩事务 |
+| Binlog 拉流 / dbsync | **§7**（§7.4–§7.18） | §6、§105、§109、§67 | TableMap、ROW、seek、LogBuffer、压缩事务 |
+| LogEvent → Entry | **§8** | §62 | parseOneRow、过滤、TransactionBuffer |
+| 背压 / 缓冲 | **§5.6** | §9.5、§16.3、§54、§81、§97 | 三层 ring + MQ |
+| Meta ack 顺序 | **§9.3** | §68、§25 | batchId 必须从小到大 |
+| Disruptor | **§50.3** | §7.16 | 压缩事务并行路径 |
+| Adapter Dml | **§13.5** | §8、§45 |
+| PositionRange ack/end | **§81.7** | §9.3 |
+| Meta ZK 刷盘 | **§59** | §25、§86 |
+| RDB SQL 落地 | **§60** | §13.7、§64 | parse4Dml / flatMessage2Dml |
 | 全链路速查 | §103 | §36、§72、§76 | |
 
 **篇 ↔ 节**：见文首 [文档导读](#文档导读) 六篇表。
