@@ -36,7 +36,7 @@
 
 **一、总览** — [§1](#1-项目定位与核心思想) · [§2](#2-maven-模块架构) · [§3](#3-整体运行时架构) · [§4](#4-启动与生命周期) · [§12](#12-关键类索引)
 
-**二、Binlog 解析链** — [§5](#5-核心数据流水线) · [§6](#6-binlog-监听底层原理重点) · [§7](#7-binlog-二进制解析dbsync) · [§8](#8-业务语义转换logeventconvert) · [§9](#9-位点与-meta-双轨管理) · [§10](#10-高可用与容错设计) · [§11](#11-技术亮点与设计亮点) · 延伸：§52 §54 §62 §67 §70 §73 §84 §105 §109
+**二、Binlog 解析链** — [§5](#5-核心数据流水线) · [§6](#6-binlog-监听底层原理重点) · **[§7](#7-binlog-二进制解析dbsync)（TableMap/ROW/checksum/压缩事务）** · [§8](#8-业务语义转换logeventconvert) · [§9](#9-位点与-meta-双轨管理) · [§10](#10-高可用与容错设计) · [§11](#11-技术亮点与设计亮点) · 延伸：§52 §54 §62 §67 §70 §73 §84 §105 §109
 
 **三、Server 与投递** — [§14](#14-deployer-与-canalcontroller) · [§15](#15-server-消费-api-与-netty) · [§16](#16-sink-与-store-源码) · [§17](#17-位点管理器与-meta-实现) · [§18](#18-过滤与表结构-tsdb) · [§19](#19-mq-投递canalmqstarter) · [§51](#51-abstractcanalinstance-组件装配与生命周期) · [§53](#53-spring-装配default-instancexml-全图) · 延伸：§55–§58 §66 §74 §80–§81 §87 §97
 
@@ -433,22 +433,30 @@ limit -= origin;
 
 ### 6.5 第四层：二进制事件解码 `LogDecoder`
 
-文件：`dbsync/.../LogDecoder.java`
+文件：`dbsync/.../LogDecoder.java`。从 `DirectLogFetcher` 得到的 `LogBuffer` 上按 **完整 event 长度** 切分；细节见 **[§7 Binlog 二进制解析](#7-binlog-二进制解析dbsync)**。
 
 ```java
 LogHeader header = new LogHeader(buffer, context.getFormatDescription());
 int len = header.getEventLen();
 if (handleSet.get(header.getType()))
-    event = decode(buffer, header, context);  // 按类型分发
+    event = decode(buffer, header, context);
 else
     event = new UnknownLogEvent(header);
-buffer.consume(len);
+buffer.consume(len);   // 消费 len 字节，指针前移
 ```
 
-- 首次遇到 `FORMAT_DESCRIPTION_EVENT` 会更新 `LogContext.formatDescription`（含 checksum 算法）；
-- `ROTATE_EVENT` 切换 `logFileName`；
-- `TABLE_MAP_EVENT` 必须在 ROWS 事件之前出现，供行解析查表结构；
-- MySQL 8.0+ 支持 `TRANSACTION_PAYLOAD_EVENT` + zstd 压缩，通过 `processIterateDecode` 解压后再迭代 decode。
+**`LogContext` 在 decode 过程中的维护**（单线程，非线程安全）：
+
+| 动作 | 触发事件 | 效果 |
+|------|----------|------|
+| `setFormatDescription` | `FORMAT_DESCRIPTION_EVENT` | 记录 post-header 长度表、checksum 算法 |
+| `putTable` | `TABLE_MAP_EVENT` | `table_id → TableMapLogEvent` 写入 `mapOfTable` |
+| `fillTable` | `WRITE/UPDATE/DELETE_ROWS_*` | 按 `table_id` 取 TableMap，缺失则 `TableIdNotFoundException` |
+| `clearAllTables` | ROW 带 `STMT_END_F` | 语句结束，清空 map（多语句事务边界） |
+| `setLogPosition` | `ROTATE_EVENT` | 换新 `logFileName` + position |
+| `setGtidSet` / `putGtid` | GTID 相关 | Header 携带 GTID 字符串 |
+
+**压缩事务**：MySQL 8.0+ `TRANSACTION_PAYLOAD_EVENT` 在 **GTID dump** 与 **并行 Parser** 路径会走 `processIterateDecode`（§7.8）；普通 `dump(file,pos)` 单线程路径 **不** 调用该方法，若仅用文件位点 dump 且 Master 开启 binlog 事务压缩，需确认是否走 GTID 或 `parallel=true`。
 
 ### 6.6 第五层：Parser 主循环 `AbstractEventParser`
 
@@ -524,43 +532,296 @@ sequenceDiagram
 
 ## 7. Binlog 二进制解析（dbsync）
 
-模块 `dbsync` 源自淘宝 TDDL 的 binlog 解析库，被 Canal 直接依赖。
+模块 `dbsync` 源自淘宝 TDDL 的 binlog 解析库（包名 `com.taobao.tddl.dbsync.binlog`），被 `MysqlConnection.dump`、`LocalBinLogConnection`、seek 扫文件共用。本节说明 **字节 → LogEvent** 的底层原理；**LogEvent → CanalEntry** 在 §8 / §62。
+
+```mermaid
+flowchart LR
+    subgraph Fetch
+        DF[DirectLogFetcher]
+        LB[LogBuffer]
+    end
+    subgraph Decode
+        LH[LogHeader]
+        LD[LogDecoder.decode]
+        CTX[LogContext]
+    end
+    subgraph Row
+        TM[TABLE_MAP]
+        WR[ROWS_EVENT]
+        RLB[RowsLogBuffer]
+    end
+    DF --> LB --> LH --> LD
+    LD --> CTX
+    TM --> CTX
+    WR --> RLB
+    LD --> WR
+```
 
 ### 7.1 核心类型
 
 | 类 | 作用 |
 |----|------|
-| `LogFetcher` / `DirectLogFetcher` | 累积字节缓冲，提供 `fetch()` |
-| `LogBuffer` | 可 `consume`、`duplicate` 的读缓冲区 |
-| `LogContext` | 当前文件、位点、GTID、FormatDescription、TableMap 缓存 |
-| `LogHeader` | event header（timestamp、type、serverId、eventLen、logPos） |
-| `LogEvent` | 各事件类型常量与基类 |
-| `*LogEvent` | `QueryLogEvent`、`WriteRowsLogEvent`、`RotateLogEvent`、`GtidLogEvent` 等 |
+| `LogFetcher` / `DirectLogFetcher` | 累积 socket/文件字节，`fetch()` 产出可 decode 的 `LogBuffer`（§6.4、§109） |
+| `LogBuffer` | 可读缓冲区；`consume(n)` 前移；`duplicate` 切子区间；支持 `limit` 截断（checksum 剥尾） |
+| `LogContext` | **单 dump 线程** 上下文：`mapOfTable`、`formatDescription`、`logPosition`、`gtidSet`、`iterateDecode` 标志 |
+| `LogHeader` | 解析 Common-Header（19 字节）+ 各事件 Post-Header，得到 `type/eventLen/logPos/...` |
+| `LogDecoder` | `decode(buffer, context)` 切事件；`decode(buffer, header, context)` 反序列化 body |
+| `*LogEvent` | 强类型事件体；ROW 类继承 `RowsLogEvent` |
 
-### 7.2 常见事件类型（节选）
+`LogDecoder` 构造时常用 `new LogDecoder(UNKNOWN_EVENT, ENUM_END_EVENT)`，即 **handleSet 包含全部事件类型**，未知类型仍走 `UnknownLogEvent` 占位。
 
-定义于 `LogEvent.java`：
+### 7.2 Binlog Event 物理布局
+
+每个 binlog event 在文件/流中连续存储，Canal 用 `LogHeader` 先读 **Common-Header**（固定 19 字节）：
+
+| 字段 | 长度 | 含义 |
+|------|------|------|
+| `timestamp` | 4 | 事件时间（秒） |
+| `type` | 1 | 事件类型枚举 |
+| `server_id` | 4 | 产生该事件的 server_id |
+| `event_len` | 4 | **整个 event** 字节长度（含 header+body+可选 checksum） |
+| `log_pos` | 4 | Master 上下一 event 的文件偏移 |
+| `flags` | 2 | 标志位 |
+
+之后是 **Post-Header**（长度由 `FormatDescriptionLogEvent` 的 `postHeaderLen[]` 决定）+ **Body**。`LogDecoder.decode(LogBuffer, LogContext)` 要求 `buffer.limit() >= event_len`，否则返回 `null`（数据未读满，rewind 等待下一包拼接）。
+
+Canal 写入 `EntryPosition` 时常用 **`logPos - eventLen` 作为 startPos**（`LogEventConvert.createPosition`），与 MySQL「event 起始偏移」语义一致。
+
+### 7.3 LogDecoder 解码流程
+
+```68:111:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/LogDecoder.java
+    public LogEvent decode(LogBuffer buffer, LogContext context) throws IOException {
+        if (limit >= FormatDescriptionLogEvent.LOG_EVENT_HEADER_LEN) {
+            LogHeader header = new LogHeader(buffer, context.getFormatDescription());
+            final int len = header.getEventLen();
+            if (limit >= len) {
+                if (handleSet.get(header.getType())) {
+                    buffer.limit(len);
+                    try {
+                        event = decode(buffer, header, context);
+                    } finally {
+                        buffer.limit(limit);
+                    }
+                } else {
+                    event = new UnknownLogEvent(header);
+                }
+                buffer.consume(len);
+                return event;
+            }
+        }
+        buffer.rewind();
+        return null;
+    }
+```
+
+**与 replication 包的关系**：一个 MySQL Packet 的 payload 里可含 **多个** binlog event；也可能一个 event 跨多个 `0xFFFFFF` 大包（§109）。`consume(len)` 保证 decoder 与 fetcher 指针同步。
+
+### 7.4 TABLE_MAP 与 ROW 事件配对
+
+ROW 格式下，MySQL 不直接在行事件里带库表名，而是：
+
+1. 先写 `TABLE_MAP_EVENT`：分配 `table_id`，携带库名、表名、列类型数组、nullable 位图、可选 metadata（MySQL 8 `binlog_row_metadata`）。
+2. 再写 `WRITE_ROWS_EVENT` / `UPDATE_ROWS_EVENT` / `DELETE_ROWS_EVENT`：只带 `table_id` + 行数据比特流。
+
+```210:215:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/LogDecoder.java
+            case LogEvent.TABLE_MAP_EVENT: {
+                TableMapLogEvent mapEvent = new TableMapLogEvent(header, buffer, descriptionEvent);
+                logPosition.position = header.getLogPos();
+                context.putTable(mapEvent);
+                return mapEvent;
+            }
+```
+
+```199:211:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/event/RowsLogEvent.java
+    public final void fillTable(LogContext context) {
+        table = context.getTable(tableId);
+        if (table == null) {
+            throw new TableIdNotFoundException("not found tableId:" + tableId);
+        }
+        if ((flags & RowsLogEvent.STMT_END_F) != 0) {
+            context.clearAllTables();
+        }
+        // 统计 JSON 列个数，供 RowsLogBuffer 解析
+    }
+```
+
+**典型顺序**（单表 INSERT）：
+
+```
+TABLE_MAP(table_id=6, db=t, tbl=user)
+WRITE_ROWS(table_id=6, columns=全列, rows=...)
+```
+
+**跨表事务**：
+
+```
+TABLE_MAP(id=6, order) → WRITE_ROWS(6)
+TABLE_MAP(id=7, item)  → WRITE_ROWS(7)
+XID_EVENT
+```
+
+`LogEventConvert` 对 `TABLE_MAP` **只更新 TableMap、通常不产出 Entry**；真正 DML Entry 在 `parseRowsEvent`。
+
+若从 **事务中间** 启动 dump（位点在 TABLE_MAP 之前），下一 ROW 找不到 map → **`TableIdNotFoundException`**（§10.3 会触发重找位点）。
+
+### 7.5 ROW 行图像与 RowsLogBuffer
+
+`RowsLogEvent` 构造时从 body 解析：
+
+| 字段 | 含义 |
+|------|------|
+| `table_id` | 关联 TableMap |
+| `flags` | 含 `STMT_END_F` 等 |
+| `columns` | `BitSet`：本行 **携带了哪些列** 的字节（见 §7.6） |
+| `changeColumns` | UPDATE 专用：after 图像列集合 |
+| `rowsBuf` | 行数据区 `LogBuffer` 切片 |
+
+```521:581:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/dbsync/LogEventConvert.java
+            RowsLogBuffer buffer = event.getRowsBuf(charset);
+            BitSet columns = event.getColumns();
+            BitSet changeColumns = event.getChangeColumns();
+            while (buffer.nextOneRow(columns, false)) {
+                if (EventType.INSERT == eventType) {
+                    parseOneRow(..., columns, true, tableMeta);   // after
+                } else if (EventType.DELETE == eventType) {
+                    parseOneRow(..., columns, false, tableMeta);  // before
+                } else {
+                    parseOneRow(..., columns, false, tableMeta);  // before
+                    buffer.nextOneRow(changeColumns, true);
+                    parseOneRow(..., changeColumns, true, tableMeta);  // after
+                }
+            }
+```
+
+`RowsLogBuffer` 按 `ColumnInfo.type/meta`（来自 TableMap）读取 MySQL 二进制字段值（`MYSQL_TYPE_LONG`、`MYSQL_TYPE_STRING`、`MYSQL_TYPE_JSON` 等），再与 **TSDB/TableMetaCache 的 FieldMeta** 对齐生成 `CanalEntry.Column`。
+
+**MariaDB 压缩 ROW**：`RowsLogEvent` 构造时若 `compress=true`，先 `uncompressBuf()` 再解析，并把 event type 从 `*_COMPRESSED_*` 映射回普通 ROW 类型（issue #4388）。
+
+### 7.6 binlog_row_image 与 BitSet columns
+
+连接建立后 `MysqlConnection.loadBinlogImage()` 查询 `@@binlog_row_image`（`FULL` / `MINIMAL` / `NOBLOB`），用于理解 Master 行为；**行事件里具体带哪些列** 由 binlog 里的 `columns` / `changeColumns` **BitSet** 表达。
+
+| binlog_row_image | Master 行为（简述） | Canal 侧 |
+|------------------|---------------------|----------|
+| **FULL** | UPDATE 记录完整 before/after（在 BitSet 标记的列上） | 列较全，易与 TableMeta 对齐 |
+| **MINIMAL** | UPDATE 仅主键 + 变更列 | `columns`/`changeColumns` 稀疏；`parseOneRow` 对 `!cols.get(i)` **直接 skip** |
+| **NOBLOB** | 不含未变更 BLOB/TEXT | 介于两者之间 |
+
+```671:676:parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/dbsync/LogEventConvert.java
+        for (int i = 0; i < columnCnt; i++) {
+            ColumnInfo info = columnInfo[i];
+            // mysql 5.6开始支持nolob/minimal类型,并不一定记录所有的列,需要进行判断
+            if (!cols.get(i)) {
+                continue;
+            }
+```
+
+**下游含义**：MINIMAL 模式下 Canal Entry 的 `beforeColumns` 可能 **只有主键**，业务若要做「全字段 diff」需查表补全，不能假设 binlog 含全行。
+
+**online DDL**：TableMap 列数 > TableMeta 字段数时，会 **强制 reload 表结构**（§73）；RDS 无主键表可能多一列 `__#alibaba_rds_row_id#__` 特殊处理。
+
+### 7.7 Checksum（CRC32）与 MariaDB 差异
+
+**探测**：`loadBinlogChecksum()` 查 `@@global.binlog_checksum`；`updateSettings()` 里 `set @master_binlog_checksum=@@global.binlog_checksum`，避免 Rotate 后首事件解析乱码（尤其 **MariaDB** 在第一个 Rotate 即带 checksum，见 `MysqlConnection` 注释 issue #1081）。
+
+**剥离**：非 `FORMAT_DESCRIPTION` 事件使用当前 `FormatDescription` 的算法；若启用 CRC32 且 **非** iterate 子解码：
+
+```182:188:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/LogDecoder.java
+        if (checksumAlg != OFF && checksumAlg != UNDEF) {
+            if (context.isIterateDecode()) {
+                // 主 TRANSACTION_PAYLOAD 已处理 checksum，子事件不再剥尾
+            } else {
+                buffer.limit(header.getEventLen() - BINLOG_CHECKSUM_LEN);
+            }
+        }
+```
+
+decode 时 body 不含最后 4 字节 CRC；`consume(event_len)` 仍按 **含 checksum 的物理长度** 推进流指针。
+
+### 7.8 TRANSACTION_PAYLOAD 压缩事务（MySQL 8.0+）
+
+大事务可将多个 event 打包进 **`TRANSACTION_PAYLOAD_EVENT`**，payload 经 **Zstd**（或无压缩）展开后再逐个 `decode`。
+
+```122:160:dbsync/src/main/java/com/taobao/tddl/dbsync/binlog/LogDecoder.java
+    public List<LogEvent> processIterateDecode(LogEvent event, LogContext context) {
+        if (event.getHeader().getType() == TRANSACTION_PAYLOAD_EVENT) {
+            // Zstd 解压 → iterateBuffer
+            context.setIterateDecode(true);
+            while (iterateBuffer.hasRemaining()) {
+                LogEvent deEvent = decode(iterateBuffer, context);
+                deEvent.getHeader().setLogFileName(event.getHeader().getLogFileName());
+                deEvent.getHeader().setLogPos(event.getHeader().getLogPos());
+                deEvent.getHeader().setEventLen(event.getHeader().getEventLen());
+                events.add(deEvent);
+            }
+            context.setIterateDecode(false);
+        }
+        return events;
+    }
+```
+
+**位点语义**：子事件 **逻辑上共享主事件的 logPos/eventLen**（物理 binlog 只有外层一条）。因此：
+
+- ack 位点仍可按外层 event 推进；
+- `BatchMode.MEMSIZE` 用 `rawLength` 时可能 **偏大**（注释：影响 getBatch 数量）。
+
+**调用路径差异**：
+
+| dump 模式 | 是否展开 TRANSACTION_PAYLOAD |
+|-----------|-------------------------------|
+| `dump(file, pos)` 单线程 | **否**（只 `decode` 一次） |
+| `dump(GTIDSet)` | **是**（`processIterateDecode`） |
+| `dump(..., MultiStageCoprocessor)` | **是**（stage2 识别后 iterate） |
+
+生产若开启 binlog 事务压缩，应优先 **GTID** 或 **`canal.instance.parser.parallel=true`**。
+
+### 7.9 Rotate、FormatDescription、GTID 与上下文重置
+
+| 事件 | dbsync 行为 | Canal 业务影响 |
+|------|-------------|----------------|
+| `FORMAT_DESCRIPTION_EVENT` | `context.setFormatDescription` | 决定 v1/v2 ROW header 长度、checksum 算法 |
+| `ROTATE_EVENT` | `context.setLogPosition(新文件名, position)` | `Entry.header.logfileName` 切换；findStart 依赖正确文件名 |
+| `PREVIOUS_GTIDS_LOG_EVENT` | 解码进 GTID 集合 | GTID 模式起始边界 |
+| `GTID_LOG_EVENT` | 更新 `context.gtidSet` | `Entry.header.gtid` |
+| `QUERY_EVENT` (BEGIN) | 文本事务开始 | 转为 `TRANSACTIONBEGIN` Entry |
+| `XID_EVENT` | InnoDB commit | 转为 `TRANSACTIONEND` Entry |
+
+`LogContext.reset()` 会清空 TableMap 与恢复默认 FormatDescription——Parser **重连** 时通过新 `LogContext` 避免脏 map。
+
+### 7.10 常见事件类型（节选）
+
+定义于 `LogEvent.java`（与 MySQL `log_event_type` 对齐）：
 
 | 常量 | 值 | 含义 |
 |------|-----|------|
 | `QUERY_EVENT` | 2 | DDL、BEGIN 等文本 SQL |
 | `ROTATE_EVENT` | 4 | 切换到新 binlog 文件 |
+| `XID_EVENT` | 16 | InnoDB 事务提交 |
 | `TABLE_MAP_EVENT` | 19 | 表结构映射（ROW 模式必需） |
 | `WRITE_ROWS_EVENT` | 30 | 插入行图像 |
 | `UPDATE_ROWS_EVENT` | 31 | 更新前后图像 |
 | `DELETE_ROWS_EVENT` | 32 | 删除行图像 |
-| `XID_EVENT` | 16 | InnoDB 事务提交 |
-| `GTID_LOG_EVENT` | - | GTID 事务边界 |
+| `GTID_LOG_EVENT` | 33 | GTID 事务边界 |
+| `TRANSACTION_PAYLOAD_EVENT` | 100 | 压缩事务容器（8.0+） |
+| `PARTIAL_UPDATE_ROWS_EVENT` | - | 8.0 部分列更新 |
 
-### 7.3 Checksum
+v1 事件（`*_V1`）与 v2 成对出现，由 `FormatDescription` 的 `post_header_len` 区分；Canal 在 `LogDecoder` switch 中 **同时处理** 两套 type 常量。
 
-MySQL 5.6+ 可在 binlog 尾追加 CRC32。Canal 通过 `loadBinlogChecksum()` 与 `set @master_binlog_checksum` 对齐；`FormatDescriptionLogEvent` 携带算法，decoder 在读取 event body 时校验/剥离。
+### 7.11 与 §8 的边界
+
+| 层次 | 模块 | 输入/输出 |
+|------|------|-----------|
+| dbsync | `LogDecoder`、`*LogEvent` | 字节 → **结构化 LogEvent**（仍含 table_id、二进制行） |
+| parse | `LogEventConvert` | LogEvent + **TableMeta** → **CanalEntry** Protobuf |
+| parse | `EventTransactionBuffer` | Entry 列表按事务 flush → Sink（§54） |
+
+读懂 §7 后，排查 **TableIdNotFound**、**列数不匹配**、**checksum 乱码**、**压缩事务无数据** 四类问题应优先对照 **TableMap / row_image / dump 路径 / checksum 会话变量**，再查 TSDB 与过滤配置。
 
 ---
 
 ## 8. 业务语义转换（LogEventConvert）
 
-文件：`parse/.../LogEventConvert.java`
+文件：`parse/.../LogEventConvert.java`。上游 **dbsync** 产出 `LogEvent` 见 **§7**；本节为 **LogEvent → CanalEntry**。
 
 `parse(LogEvent)` 按 `eventType` switch：
 
@@ -6546,7 +6807,8 @@ MySQL → Parser → Store
 | 想查… | 主读 | 延伸 |
 |--------|------|------|
 | 全局 / 一页纸 | §103、§3、§5 | 导读六篇表 |
-| binlog 怎么读 | §6–§8 | §105、§109 |
+| binlog 怎么读 | §6–§8 | **§7**（dbsync 深度）、§105、§109 |
+| TableMap/ROW/压缩事务 | §7.4–§7.8 | §62、§73 |
 | 客户端协议 | §37–§38 | §80 |
 | Store 背压 | §16.3 | §55、§81 |
 | ZK HA | §41.4 | §99 |
@@ -7023,7 +7285,7 @@ flowchart LR
 | Session / Netty | §15 | §80、§87 | |
 | 多流 / RDS | §33 | §91、§95 | |
 | Adapter 总览 | §13 | §44、§60–§64、§102 | |
-| Binlog 拉流 | §6 | §105、§109、§67 | |
+| Binlog 拉流 / dbsync | **§7**（§7.4–§7.8） | §6、§105、§109、§67、§62 | TableMap、ROW、checksum、压缩事务 |
 | 全链路速查 | §103 | §36、§72、§76 | |
 
 **篇 ↔ 节**：见文首 [文档导读](#文档导读) 六篇表。
